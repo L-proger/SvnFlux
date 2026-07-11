@@ -29,12 +29,31 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-      - name: Install SVN client
+      - name: Download verified SVN client
         shell: pwsh
         run: |
-          choco install sliksvn --version=1.14.5 -y --no-progress
-          if ($LASTEXITCODE -notin @(0, 1641, 3010)) { exit $LASTEXITCODE }
-          svn --version --quiet
+          $archive = Join-Path $env:RUNNER_TEMP 'Slik-Subversion-1.14.5-x64.zip'
+          $expanded = Join-Path $env:RUNNER_TEMP 'Slik-Subversion'
+          $install = Join-Path $env:RUNNER_TEMP 'SlikSvn'
+          curl.exe --fail --location --retry 5 --retry-all-errors --retry-delay 5 --output $archive 'https://sliksvn.com/pub/Slik-Subversion-1.14.5-x64.zip'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $expectedHash = '77D4FE02999DDA3BDC3A20E86243AE6EDE99AAF072B4C12B0CDEDB54D88E954A'
+          $actualHash = (Get-FileHash $archive -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) {
+            throw "SVN archive checksum mismatch: expected $expectedHash, actual $actualHash."
+          }
+
+          Expand-Archive $archive -DestinationPath $expanded
+          $msi = Get-ChildItem $expanded -Recurse -Filter '*.msi' | Select-Object -First 1
+          if ($null -eq $msi) { throw 'The SVN archive does not contain an MSI installer.' }
+          $arguments = @('/i', $msi.FullName, '/qn', '/norestart', 'INSTALLLEVEL=300', "INSTALLLOCATION=$install")
+          $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 1641, 3010)) { exit $process.ExitCode }
+
+          $svnBin = Join-Path $install 'bin'
+          $svnBin >> $env:GITHUB_PATH
+          & (Join-Path $svnBin 'svn.exe') --version --quiet
 
       - name: Select package version
         id: version
