@@ -1,0 +1,77 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Playground: RaSvn",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/SvnFlux.Playground/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": [
+        "rasvn",
+        "--port",
+        "3690",
+        "--repository",
+        "repository",
+        "--path",
+        "${workspaceFolder}/.playground-data/rasvn-repository"
+      ],
+      "cwd": "${workspaceFolder}/SvnFlux.Playground",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Playground: RaSvn trace viewer",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/SvnFlux.Playground/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": [
+        "rasvn",
+        "--port",
+        "3690",
+        "--repository",
+        "repository",
+        "--path",
+        "${workspaceFolder}/.playground-data/rasvn-repository",
+        "--trace"
+      ],
+      "cwd": "${workspaceFolder}/SvnFlux.Playground",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Playground: RaSvn + publish update",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/SvnFlux.Playground/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": [
+        "rasvn",
+        "--port",
+        "3690",
+        "--repository",
+        "repository",
+        "--path",
+        "${workspaceFolder}/.playground-data/rasvn-repository",
+        "--publish-update"
+      ],
+      "cwd": "${workspaceFolder}/SvnFlux.Playground",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Playground: CLI help",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/SvnFlux.Playground/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": [
+        "--help"
+      ],
+      "cwd": "${workspaceFolder}/SvnFlux.Playground",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    }
+  ]
+}

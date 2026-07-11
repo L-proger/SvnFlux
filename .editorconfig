@@ -1,0 +1,17 @@
+root = true
+
+[*.{cs,csx}]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+max_line_length = 160
+
+# K&R braces: opening braces stay on the declaration or statement line.
+csharp_new_line_before_open_brace = none
+csharp_new_line_before_else = false
+csharp_new_line_before_catch = false
+csharp_new_line_before_finally = false
+csharp_preserve_single_line_blocks = true
+csharp_preserve_single_line_statements = true
