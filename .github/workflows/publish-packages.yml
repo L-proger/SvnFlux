@@ -1,0 +1,73 @@
+name: Publish packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version, for example 0.1.0-preview.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Select package version
+        id: version
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $version = '${{ inputs.version }}'
+          } else {
+            $version = '${{ github.ref_name }}'.TrimStart('v')
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Invalid package version '$version'."
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+      - name: Restore
+        run: dotnet restore SvnFlux.slnx
+      - name: Test
+        run: dotnet test SvnFlux.slnx -c Release --no-restore
+      - name: Pack libraries
+        shell: pwsh
+        run: |
+          $projects = @(
+            'SvnFlux.Core/src/SvnFlux.Core/SvnFlux.Core.csproj',
+            'SvnFlux.Svndiff/src/SvnFlux.Svndiff/SvnFlux.Svndiff.csproj',
+            'SvnFlux.RaSvn/src/SvnFlux.RaSvn/SvnFlux.RaSvn.csproj',
+            'SvnFlux.Repository.FileSystem/src/SvnFlux.Repository.FileSystem/SvnFlux.Repository.FileSystem.csproj'
+          )
+          foreach ($project in $projects) {
+            dotnet pack $project -c Release --no-restore --no-build `
+              -p:PackageVersion=${{ steps.version.outputs.value }} `
+              --output artifacts/packages
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Publish to GitHub Packages
+        shell: pwsh
+        run: |
+          Get-ChildItem artifacts/packages/*.nupkg | ForEach-Object {
+            dotnet nuget push $_.FullName `
+              --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" `
+              --api-key "${{ secrets.GITHUB_TOKEN }}" `
+              --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

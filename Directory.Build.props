@@ -1,0 +1,19 @@
+<Project>
+  <PropertyGroup>
+    <Authors>Sergey Serb</Authors>
+    <Company>SvnFlux</Company>
+    <Product>SvnFlux</Product>
+    <Description>Managed Subversion protocol, repository, and svndiff components.</Description>
+    <VersionPrefix>0.1.0</VersionPrefix>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/L-proger/SvnFlux</RepositoryUrl>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>

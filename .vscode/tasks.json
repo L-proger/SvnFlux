@@ -27,7 +27,7 @@
       "command": "dotnet",
       "args": [
         "test",
-        "${workspaceFolder}/SvnFlux.Core/SvnFlux.slnx",
+        "${workspaceFolder}/SvnFlux.slnx",
         "--nologo"
       ],
       "options": {

@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="SvnFlux.Core/src/SvnFlux.Core/SvnFlux.Core.csproj" />
+    <Project Path="SvnFlux.Svndiff/src/SvnFlux.Svndiff/SvnFlux.Svndiff.csproj" />
+    <Project Path="SvnFlux.RaSvn/src/SvnFlux.RaSvn/SvnFlux.RaSvn.csproj" />
+    <Project Path="SvnFlux.Repository.FileSystem/src/SvnFlux.Repository.FileSystem/SvnFlux.Repository.FileSystem.csproj" />
+    <Project Path="SvnFlux.Playground/SvnFlux.Playground.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="SvnFlux.Core/tests/SvnFlux.Core.Tests/SvnFlux.Core.Tests.csproj" />
+    <Project Path="SvnFlux.Svndiff/tests/SvnFlux.Svndiff.Tests/SvnFlux.Svndiff.Tests.csproj" />
+    <Project Path="SvnFlux.RaSvn/tests/SvnFlux.RaSvn.Tests/SvnFlux.RaSvn.Tests.csproj" />
+    <Project Path="SvnFlux.RaSvn/tests/SvnFlux.RaSvn.IntegrationTests/SvnFlux.RaSvn.IntegrationTests.csproj" />
+    <Project Path="SvnFlux.Repository.FileSystem/tests/SvnFlux.Repository.FileSystem.Tests/SvnFlux.Repository.FileSystem.Tests.csproj" />
+  </Folder>
+</Solution>
