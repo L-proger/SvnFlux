@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using SvnFlux.Core;
 
 namespace SvnFlux.Http;
@@ -9,6 +10,7 @@ namespace SvnFlux.Http;
 public static class SvnHttpEndpointExtensions {
     public static IServiceCollection AddSvnFluxHttp(this IServiceCollection services, Action<SvnHttpOptions>? configure = null) {
         services.AddOptions<SvnHttpOptions>();
+        services.TryAddSingleton<SvnHttpTransactionStore>();
         if (configure is not null) services.Configure(configure);
         return services;
     }

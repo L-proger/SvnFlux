@@ -11,6 +11,23 @@ internal static class SvnDavXml {
     internal const string Custom = "http://subversion.tigris.org/xmlns/custom/";
     internal const string SvnDav = "http://subversion.tigris.org/xmlns/dav/";
 
+    internal static async Task WriteErrorAsync(HttpResponse response, int statusCode, int errorCode, string message, CancellationToken token) {
+        response.StatusCode = statusCode;
+        response.ContentType = "text/xml; charset=utf-8";
+        var settings = new XmlWriterSettings { Async = true, Encoding = new System.Text.UTF8Encoding(false), CloseOutput = false };
+        await using var writer = XmlWriter.Create(response.Body, settings);
+        await writer.WriteStartDocumentAsync().ConfigureAwait(false);
+        writer.WriteStartElement("D", "error", Dav);
+        writer.WriteAttributeString("xmlns", "m", null, "http://apache.org/dav/xmlns");
+        writer.WriteStartElement("m", "human-readable", "http://apache.org/dav/xmlns");
+        writer.WriteAttributeString("errcode", errorCode.ToString(CultureInfo.InvariantCulture));
+        writer.WriteString(message);
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+        await writer.WriteEndDocumentAsync().ConfigureAwait(false);
+        await writer.FlushAsync().ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+    }
     private static readonly XmlQualifiedName[] DefaultProperties = [
         new("resourcetype", Dav), new("getcontentlength", Dav), new("getcontenttype", Dav), new("getlastmodified", Dav),
         new("creationdate", Dav), new("getetag", Dav), new("version-name", Dav), new("creator-displayname", Dav),

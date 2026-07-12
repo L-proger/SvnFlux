@@ -2,9 +2,9 @@ using SvnFlux.Core;
 
 namespace SvnFlux.Http;
 
-internal enum SvnHttpResourceKind { Public, Me, Revision, RevisionRoot }
+internal enum SvnHttpResourceKind { Public, Me, Revision, RevisionRoot, Transaction, TransactionRoot }
 
-internal readonly record struct SvnHttpResource(SvnHttpResourceKind Kind, SvnRevision? Revision, SvnRepositoryPath Path) {
+internal readonly record struct SvnHttpResource(SvnHttpResourceKind Kind, SvnRevision? Revision, SvnRepositoryPath Path, string? TransactionId = null) {
     public static bool TryParse(string? value, string specialSegment, out SvnHttpResource resource) {
         value ??= "";
         if (value.Contains("%2f", StringComparison.OrdinalIgnoreCase) || value.Contains("%5c", StringComparison.OrdinalIgnoreCase)) { resource = default; return false; }
@@ -23,7 +23,17 @@ internal readonly record struct SvnHttpResource(SvnHttpResourceKind Kind, SvnRev
             try { resource = new(SvnHttpResourceKind.RevisionRoot, new(revision), new(Uri.UnescapeDataString(string.Join('/', parts.Skip(3))))); return true; }
             catch (Exception exception) when (exception is ArgumentException or UriFormatException) { resource = default; return false; }
         }
+        if (parts.Length == 3 && parts[1] == "txn" && IsTransactionId(parts[2])) {
+            resource = new(SvnHttpResourceKind.Transaction, null, new(""), parts[2]); return true;
+        }
+        if (parts.Length >= 3 && parts[1] == "txr" && IsTransactionId(parts[2])) {
+            try { resource = new(SvnHttpResourceKind.TransactionRoot, null, new(Uri.UnescapeDataString(string.Join('/', parts.Skip(3)))), parts[2]); return true; }
+            catch (Exception exception) when (exception is ArgumentException or UriFormatException) { resource = default; return false; }
+        }
         resource = default;
         return false;
     }
+
+    private static bool IsTransactionId(string value) =>
+        value.Length == 32 && value.All(character => char.IsAsciiHexDigit(character));
 }

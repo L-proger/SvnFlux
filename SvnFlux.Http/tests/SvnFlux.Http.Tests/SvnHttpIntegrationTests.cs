@@ -204,6 +204,109 @@ public sealed class SvnHttpIntegrationTests {
             Assert.Equal("branch", await File.ReadAllTextAsync(Path.Combine(copiedWorkingCopy, "app.txt")));
         } finally { DeleteDirectory(root); }
     }
+    [Fact]
+    public async Task OfficialClientCanModifyAndCommit() {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-commit-" + Guid.NewGuid().ToString("N"));
+        var workingCopy = Path.Combine(root, "working-copy");
+        Directory.CreateDirectory(root);
+        try {
+            var repository = new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository);
+            await RunSvnAsync(server, "checkout", server.Url, workingCopy);
+            await File.WriteAllTextAsync(Path.Combine(workingCopy, "readme.txt"), "committed over http");
+
+            var commit = await RunSvnAsync(server, "commit", "-m", "http commit", Path.Combine(workingCopy, "readme.txt"));
+
+            Assert.Contains("Committed revision 3.", commit);
+            Assert.Equal("committed over http", await RunSvnAsync(server, "cat", server.Url + "/readme.txt"));
+            Assert.Contains("http commit", await RunSvnAsync(server, "log", "-r", "3", server.Url));
+        } finally { DeleteDirectory(root); }
+    }
+
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OfficialClientCanAddDeleteCopySetPropertiesAndCommit(bool fileSystem) {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-full-commit-" + Guid.NewGuid().ToString("N"));
+        var workingCopy = Path.Combine(root, "working-copy");
+        Directory.CreateDirectory(root);
+        try {
+            ISvnWritableRepository repository = fileSystem
+                ? await SvnFileSystemRepository.CreateAsync(Path.Combine(root, "repository"))
+                : new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository);
+            await RunSvnAsync(server, "checkout", server.Url, workingCopy);
+
+            var notes = Path.Combine(workingCopy, "notes");
+            Directory.CreateDirectory(notes);
+            await File.WriteAllTextAsync(Path.Combine(notes, "new.txt"), "new over http");
+            await RunSvnAsync(server, "add", notes);
+            await RunSvnAsync(server, "copy", Path.Combine(workingCopy, "src"), Path.Combine(workingCopy, "copied-src"));
+            await File.WriteAllTextAsync(Path.Combine(workingCopy, "copied-src", "code.cs"), "class Copied { int Value; }");
+            await RunSvnAsync(server, "move", Path.Combine(workingCopy, "docs.txt"), Path.Combine(workingCopy, "guide.txt"));
+            await RunSvnAsync(server, "delete", Path.Combine(workingCopy, "src", "code.cs"));
+            await RunSvnAsync(server, "propset", "demo", "v3", Path.Combine(workingCopy, "readme.txt"));
+
+            var commit = await RunSvnAsync(server, "commit", "-m", "full http commit", workingCopy);
+
+            Assert.Contains("Committed revision 3.", commit);
+            Assert.Equal("new over http", await RunSvnAsync(server, "cat", server.Url + "/notes/new.txt"));
+            Assert.Equal("class Copied { int Value; }", await RunSvnAsync(server, "cat", server.Url + "/copied-src/code.cs"));
+            Assert.Equal("documentation", await RunSvnAsync(server, "cat", server.Url + "/guide.txt"));
+            Assert.Equal("v3", await RunSvnAsync(server, "propget", "demo", server.Url + "/readme.txt"));
+            var committedRoot = await repository.OpenRevisionAsync(new(3));
+            var committedProperties = await committedRoot.GetPropertiesAsync(new("readme.txt"));
+            Assert.Contains(committedProperties, property => property.Name == "demo" && Encoding.UTF8.GetString(property.Value.Span) == "v3");
+            var list = await RunSvnAsync(server, "list", server.Url);
+            Assert.DoesNotContain("docs.txt", list);
+            Assert.Equal("", await RunSvnAsync(server, "list", server.Url + "/src"));
+        } finally { DeleteDirectory(root); }
+    }
+
+    [Fact]
+    public async Task OutOfDateCommitReturnsSvnErrorAndPublishesNothing() {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-out-of-date-" + Guid.NewGuid().ToString("N"));
+        var first = Path.Combine(root, "first");
+        var second = Path.Combine(root, "second");
+        Directory.CreateDirectory(root);
+        try {
+            var repository = new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository);
+            await RunSvnAsync(server, "checkout", server.Url, first);
+            await RunSvnAsync(server, "checkout", server.Url, second);
+            await File.WriteAllTextAsync(Path.Combine(first, "readme.txt"), "first writer");
+            await RunSvnAsync(server, "commit", "-m", "first", Path.Combine(first, "readme.txt"));
+            await File.WriteAllTextAsync(Path.Combine(second, "readme.txt"), "stale writer");
+
+            var failure = await Record.ExceptionAsync(() => RunSvnAsync(server, "commit", "-m", "stale", Path.Combine(second, "readme.txt")));
+
+            Assert.NotNull(failure);
+            Assert.Contains("E160028", failure.Message);
+            Assert.Equal(new SvnRevision(3), await repository.GetLatestRevisionAsync());
+            Assert.Equal("first writer", await RunSvnAsync(server, "cat", server.Url + "/readme.txt"));
+        } finally { DeleteDirectory(root); }
+    }
+    [Fact]
+    public async Task OfficialClientCanCommitLargeBinaryFile() {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-large-commit-" + Guid.NewGuid().ToString("N"));
+        var workingCopy = Path.Combine(root, "working-copy");
+        Directory.CreateDirectory(root);
+        try {
+            await using var server = await TestServer.StartAsync();
+            await RunSvnAsync(server, "checkout", server.Url, workingCopy);
+            var expected = Enumerable.Range(0, 3_000_017).Select(value => (byte)(value * 131 + 17)).ToArray();
+            var path = Path.Combine(workingCopy, "large.bin");
+            await File.WriteAllBytesAsync(path, expected);
+            await RunSvnAsync(server, "add", path);
+
+            var commit = await RunSvnAsync(server, "commit", "-m", "large binary", path);
+
+            Assert.Contains("Committed revision 3.", commit);
+            using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+            Assert.Equal(expected, await client.GetByteArrayAsync(server.Url + "/large.bin"));
+        } finally { DeleteDirectory(root); }
+    }
 
     private static SvnRevisionProperties RevisionProperties(string message) =>
         new("tester", DateTimeOffset.UtcNow, message, SvnPropertyCollection.Empty);

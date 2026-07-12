@@ -7,11 +7,12 @@ using SvnFlux.Svndiff;
 namespace SvnFlux.Http;
 
 internal static class SvnHttpServer {
-    internal static readonly string[] Methods = ["OPTIONS", "PROPFIND", "REPORT", "GET", "HEAD"];
+    internal static readonly string[] Methods = ["OPTIONS", "PROPFIND", "REPORT", "GET", "HEAD", "POST", "PROPPATCH", "PUT", "MERGE", "DELETE", "MKCOL", "COPY"];
 
     internal static async Task HandleAsync(HttpContext context, ISvnRepository repository, string? path) {
         string? detail = null;
         var options = context.RequestServices.GetService<IOptions<SvnHttpOptions>>()?.Value ?? new();
+        var transactions = context.RequestServices.GetRequiredService<SvnHttpTransactionStore>();
         try {
             if (!SvnHttpResource.TryParse(path, options.SpecialResourceSegment, out var resource)) { context.Response.StatusCode = 400; return; }
             switch (context.Request.Method) {
@@ -20,11 +21,23 @@ internal static class SvnHttpServer {
                 case "GET": await GetAsync(context, repository, resource, false).ConfigureAwait(false); break;
                 case "REPORT": await ReportAsync(context, repository, resource, options).ConfigureAwait(false); break;
                 case "HEAD": await GetAsync(context, repository, resource, true).ConfigureAwait(false); break;
+                case "POST": await SvnHttpCommit.PostAsync(context, repository, resource, options, transactions).ConfigureAwait(false); break;
+                case "PROPPATCH": await SvnHttpCommit.PropPatchAsync(context, repository, resource, options, transactions).ConfigureAwait(false); break;
+                case "PUT": await SvnHttpCommit.PutAsync(context, repository, resource, transactions).ConfigureAwait(false); break;
+                case "MERGE": await SvnHttpCommit.MergeAsync(context, repository, resource, options, transactions, RepositoryRoot(context)).ConfigureAwait(false); break;
+                case "DELETE": await SvnHttpCommit.DeleteAsync(context, repository, resource, transactions).ConfigureAwait(false); break;
+                case "MKCOL": await SvnHttpCommit.MakeCollectionAsync(context, repository, resource, transactions).ConfigureAwait(false); break;
+                case "COPY": await SvnHttpCommit.CopyAsync(context, repository, resource, options, transactions, RepositoryRoot(context)).ConfigureAwait(false); break;
                 default: context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; break;
             }
         } catch (BadHttpRequestException exception) { detail = exception.Message; context.Response.StatusCode = exception.StatusCode; }
         catch (SvnPathNotFoundException exception) { detail = exception.Message; context.Response.StatusCode = StatusCodes.Status404NotFound; }
         catch (SvnInvalidRevisionException exception) { detail = exception.Message; context.Response.StatusCode = StatusCodes.Status404NotFound; }
+        catch (SvnOutOfDateException exception) {
+            detail = exception.Message;
+            await SvnDavXml.WriteErrorAsync(context.Response, StatusCodes.Status409Conflict, 160028, exception.Message, context.RequestAborted).ConfigureAwait(false);
+        }
+        catch (SvnHttpTransactionNotFoundException) { context.Response.StatusCode = StatusCodes.Status404NotFound; }
         catch (Exception exception) { detail = exception.ToString(); context.Response.StatusCode = StatusCodes.Status500InternalServerError; throw; }
         finally {
             if (detail is null && context.Items.TryGetValue("SvnFlux.Http.Trace", out var traceDetail)) detail = traceDetail?.ToString();
@@ -65,6 +78,8 @@ internal static class SvnHttpServer {
         var root = await repository.OpenRevisionAsync(revisionNumber, context.RequestAborted).ConfigureAwait(false);
         var node = await ReadNodeAsync(root, resource.Path, context.Request.Path, context.RequestAborted).ConfigureAwait(false);
         if (node is null) { context.Response.StatusCode = 404; return; }
+        context.Items["SvnFlux.Http.Trace"] = "requested=" + string.Join(", ", requested.Select(property => property.Namespace + property.Name)) +
+            "; node-properties=" + string.Join(", ", node.Properties.Select(property => property.Name));
         var nodes = new List<SvnDavNode> { node };
         var depth = context.Request.Headers["Depth"].ToString();
         if (depth is not ("0" or "1" or "")) { context.Response.StatusCode = 403; return; }
@@ -77,7 +92,15 @@ internal static class SvnHttpServer {
             }
         }
         var stub = RepositoryRoot(context) + "/" + options.SpecialResourceSegment + "/rvr";
-        await SvnDavXml.WriteNodesAsync(context.Response, nodes, requested, repository.Id, stub, context.RequestAborted).ConfigureAwait(false);
+        var responseProperties = requested.ToList();
+        if (requested.Any(property => property.Namespace == SvnDavXml.SvnDav && property.Name == "deadprop-count")) {
+            foreach (var property in nodes.SelectMany(value => value.Properties).Select(value =>
+                value.Name.StartsWith("svn:", StringComparison.Ordinal)
+                    ? new System.Xml.XmlQualifiedName(value.Name[4..], SvnDavXml.Svn)
+                    : new System.Xml.XmlQualifiedName(value.Name, SvnDavXml.Custom)).Distinct())
+                if (!responseProperties.Contains(property)) responseProperties.Add(property);
+        }
+        await SvnDavXml.WriteNodesAsync(context.Response, nodes, responseProperties, repository.Id, stub, context.RequestAborted).ConfigureAwait(false);
     }
 
 
