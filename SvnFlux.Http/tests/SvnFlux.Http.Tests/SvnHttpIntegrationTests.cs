@@ -373,6 +373,154 @@ public sealed class SvnHttpIntegrationTests {
         } finally { DeleteDirectory(root); }
     }
 
+    [Fact]
+    public async Task StartupRemovesOrphanTransactionStorage() {
+        var orphan = Path.Combine(Path.GetTempPath(), "svnflux-http", "orphan-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(orphan);
+        await File.WriteAllTextAsync(Path.Combine(orphan, "upload.file"), "orphan");
+        try {
+            await using var server = await TestServer.StartAsync();
+            using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+            using var response = await client.SendAsync(new(HttpMethod.Options, server.Url));
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.False(Directory.Exists(orphan));
+        } finally { if (Directory.Exists(orphan)) Directory.Delete(orphan, true); }
+    }
+
+    [Fact]
+    public async Task MalformedSvndiffAndChecksumMismatchReturnTypedSvnErrors() {
+        await using var server = await TestServer.StartAsync();
+        using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+        var first = await CreateTransactionAsync(client, server.Url);
+        using var malformed = new HttpRequestMessage(HttpMethod.Put, server.Url + "/!svn/txr/" + first + "/readme.txt") { Content = new ByteArrayContent("bad"u8.ToArray()) };
+        malformed.Content.Headers.ContentType = new("application/vnd.svn-svndiff");
+        malformed.Headers.Add("X-SVN-Version-Name", "2");
+        using var malformedResponse = await client.SendAsync(malformed);
+        Assert.Equal(HttpStatusCode.BadRequest, malformedResponse.StatusCode);
+        Assert.Contains("errcode=\"140001\"", await malformedResponse.Content.ReadAsStringAsync());
+
+        var second = await CreateTransactionAsync(client, server.Url);
+        using var checksum = new HttpRequestMessage(HttpMethod.Put, server.Url + "/!svn/txr/" + second + "/readme.txt") { Content = new ByteArrayContent("changed"u8.ToArray()) };
+        checksum.Headers.Add("X-SVN-Version-Name", "2");
+        checksum.Headers.Add("X-SVN-Result-Fulltext-MD5", new string('0', 32));
+        using var checksumResponse = await client.SendAsync(checksum);
+        Assert.Equal(HttpStatusCode.BadRequest, checksumResponse.StatusCode);
+        Assert.Contains("errcode=\"200014\"", await checksumResponse.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task ConcurrentMergePublishesTransactionOnce() {
+        var repository = new SvnMemoryRepository();
+        await using var server = await TestServer.StartAsync(repository);
+        using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+        var transaction = await CreateTransactionAsync(client, server.Url);
+        var xml = $"<D:merge xmlns:D=\"DAV:\"><D:source><D:href>{server.Url}/!svn/txn/{transaction}</D:href></D:source></D:merge>";
+        Task<HttpResponseMessage> SendAsync() => client.SendAsync(new(HttpMethod.Parse("MERGE"), server.Url) { Content = new StringContent(xml, Encoding.UTF8, "text/xml") });
+
+        var firstRequest = SendAsync();
+        var secondRequest = SendAsync();
+        using var first = await firstRequest;
+        using var second = await secondRequest;
+
+        Assert.Contains(HttpStatusCode.OK, new[] { first.StatusCode, second.StatusCode });
+        Assert.Contains(new[] { first.StatusCode, second.StatusCode }, value => value is HttpStatusCode.Conflict or HttpStatusCode.NotFound);
+        Assert.Equal(new SvnRevision(3), await repository.GetLatestRevisionAsync());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LocksRefreshExpireAndProtectRecursiveDelete(bool fileSystem) {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-advanced-locks-" + Guid.NewGuid().ToString("N"));
+        var workingCopy = Path.Combine(root, "working-copy");
+        Directory.CreateDirectory(root);
+        try {
+            ISvnWritableRepository repository = fileSystem ? await SvnFileSystemRepository.CreateAsync(Path.Combine(root, "repository")) : new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository);
+            using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+            using var create = new HttpRequestMessage(HttpMethod.Parse("LOCK"), server.Url + "/readme.txt") {
+                Content = new StringContent("""<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>""", Encoding.UTF8, "text/xml")
+            };
+            create.Headers.TryAddWithoutValidation("Timeout", "Second-60");
+            using var created = await client.SendAsync(create);
+            var token = created.Headers.GetValues("Lock-Token").Single();
+            using var refresh = new HttpRequestMessage(HttpMethod.Parse("LOCK"), server.Url + "/readme.txt");
+            refresh.Headers.TryAddWithoutValidation("If", "(" + token + ")");
+            refresh.Headers.TryAddWithoutValidation("Timeout", "Second-120");
+            using var refreshed = await client.SendAsync(refresh);
+            Assert.Equal(HttpStatusCode.OK, refreshed.StatusCode);
+            Assert.Equal(token, refreshed.Headers.GetValues("Lock-Token").Single());
+            var refreshedLock = await repository.GetLockAsync(new("readme.txt"));
+            Assert.True(refreshedLock?.Expires > DateTimeOffset.UtcNow.AddSeconds(90));
+            await repository.RefreshLockAsync(new("readme.txt"), refreshedLock!.Token, DateTimeOffset.UtcNow.AddSeconds(-1));
+            Assert.Null(await repository.GetLockAsync(new("readme.txt")));
+            var latest = await repository.GetLatestRevisionAsync();
+            await repository.CommitAsync(new(latest, RevisionProperties("second child"), [SvnCommitChange.AddFile(new("src/other.cs"), "class Other {}"u8)]));
+            await RunSvnAsync(server, "checkout", server.Url, workingCopy);
+            await RunSvnAsync(server, "lock", "-m", "one", Path.Combine(workingCopy, "src", "code.cs"));
+            await RunSvnAsync(server, "lock", "-m", "two", Path.Combine(workingCopy, "src", "other.cs"));
+            await RunSvnAsync(server, "delete", Path.Combine(workingCopy, "src"));
+            Assert.Contains("Committed revision 4.", await RunSvnAsync(server, "commit", "-m", "recursive delete", workingCopy));
+            var remaining = new List<SvnLock>();
+            await foreach (var value in repository.GetLocksAsync(new("src"))) remaining.Add(value);
+            Assert.Empty(remaining);
+        } finally { DeleteDirectory(root); }
+    }
+
+    [Fact]
+    public async Task RemoteStatusReportsOtherUsersLockWithoutOwningItsToken() {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-remote-lock-" + Guid.NewGuid().ToString("N"));
+        var workingCopy = Path.Combine(root, "working-copy");
+        Directory.CreateDirectory(root);
+        try {
+            var repository = new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository);
+            await RunSvnAsync(server, "checkout", server.Url, workingCopy);
+            await repository.LockAsync(new(new("readme.txt"), "other", "remote", false, new(2)));
+            var status = await RunSvnAsync(server, "status", "-u", workingCopy);
+            Assert.Contains("readme.txt", status);
+            Assert.Contains('O', status);
+            Assert.DoesNotContain("Lock Token", await RunSvnAsync(server, "info", Path.Combine(workingCopy, "readme.txt")));
+        } finally { DeleteDirectory(root); }
+    }
+
+    [Fact]
+    public async Task AbortedPutAndMergeBodiesPublishNothing() {
+        var repository = new SvnMemoryRepository();
+        await using var server = await TestServer.StartAsync(repository);
+        using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+        var putTransaction = await CreateTransactionAsync(client, server.Url);
+        using (var put = new HttpRequestMessage(HttpMethod.Put, server.Url + "/!svn/txr/" + putTransaction + "/readme.txt") { Content = new FailingContent("SVN"u8.ToArray()) }) {
+            put.Headers.Add("X-SVN-Version-Name", "2");
+            put.Content.Headers.ContentType = new("application/vnd.svn-svndiff");
+            _ = await Record.ExceptionAsync(async () => { using var response = await client.SendAsync(put); });
+        }
+        using (var abort = await client.DeleteAsync(server.Url + "/!svn/txn/" + putTransaction)) Assert.Equal(HttpStatusCode.NoContent, abort.StatusCode);
+
+        var mergeTransaction = await CreateTransactionAsync(client, server.Url);
+        var prefix = Encoding.UTF8.GetBytes($"<D:merge xmlns:D=\"DAV:\"><D:source><D:href>{server.Url}/!svn/txn/{mergeTransaction}");
+        using (var merge = new HttpRequestMessage(HttpMethod.Parse("MERGE"), server.Url) { Content = new FailingContent(prefix) })
+            _ = await Record.ExceptionAsync(async () => { using var response = await client.SendAsync(merge); });
+        using (var abort = await client.DeleteAsync(server.Url + "/!svn/txn/" + mergeTransaction)) Assert.Equal(HttpStatusCode.NoContent, abort.StatusCode);
+        Assert.Equal(new SvnRevision(2), await repository.GetLatestRevisionAsync());
+    }
+
+    private sealed class FailingContent(byte[] prefix) : HttpContent {
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context) {
+            await stream.WriteAsync(prefix);
+            await stream.FlushAsync();
+            throw new IOException("Simulated client disconnect.");
+        }
+        protected override bool TryComputeLength(out long length) { length = 0; return false; }
+    }
+
+    private static async Task<string> CreateTransactionAsync(HttpClient client, string url) {
+        using var request = new HttpRequestMessage(HttpMethod.Post, url + "/!svn/me") { Content = new StringContent("( create-txn )") };
+        using var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        return response.Headers.GetValues("SVN-Txn-Name").Single();
+    }
+
     private static SvnRevisionProperties RevisionProperties(string message) =>
         new("tester", DateTimeOffset.UtcNow, message, SvnPropertyCollection.Empty);
 

@@ -200,8 +200,11 @@ public sealed class SvnFileSystemRepository : ISvnWritableRepository
     public async ValueTask<SvnRevision> CommitAsync(SvnCommitRequest request, CancellationToken cancellationToken = default) {
         ArgumentNullException.ThrowIfNull(request);
         foreach (var change in request.Changes) {
-            var fileLock = await GetLockAsync(change.Path, cancellationToken).ConfigureAwait(false);
-            if (fileLock is not null && (!request.LockTokens.TryGetValue(change.Path, out var token) || token != fileLock.Token)) { throw new SvnLockException(change.Path, "a matching lock token is required for this commit."); }
+            await foreach (var fileLock in GetLocksAsync(change.Path, cancellationToken).ConfigureAwait(false)) {
+                if (fileLock.Path != change.Path && !(change.Action == SvnCommitChangeAction.Delete && change.NodeKind == SvnNodeKind.Directory)) continue;
+                if (!request.LockTokens.TryGetValue(fileLock.Path, out var token) || token != fileLock.Token)
+                    throw new SvnLockException(fileLock.Path, "a matching lock token is required for this commit.");
+            }
         }
         var changes = request.Changes.Select(change => {
             var result = change.Action switch {
@@ -231,13 +234,30 @@ public sealed class SvnFileSystemRepository : ISvnWritableRepository
             if (info.Kind != SvnNodeKind.File) { throw new SvnLockException(request.Path, "only files can be locked."); }
             if (request.CurrentRevision is { } current && info.LastChangedRevision.Value > current.Value) { throw new SvnOutOfDateException(current, info.LastChangedRevision); }
             var lockPath = GetLockPath(request.Path);
-            if (File.Exists(lockPath) && !request.StealLock) { throw new SvnLockException(request.Path, "the path is already locked."); }
-            var value = new SvnLock("opaquelocktoken:" + Guid.NewGuid(), request.Path, request.Owner, request.Comment, DateTimeOffset.UtcNow);
+            var existing = await ReadLockAsync(lockPath, cancellationToken).ConfigureAwait(false);
+            if (existing is not null && !request.StealLock) { throw new SvnLockException(request.Path, "the path is already locked."); }
+            var value = new SvnLock("opaquelocktoken:" + Guid.NewGuid(), request.Path, request.Owner, request.Comment, DateTimeOffset.UtcNow, request.Expires);
             var temporaryPath = lockPath + ".tmp-" + Guid.NewGuid().ToString("N");
             await WriteJsonAsync(temporaryPath, ToDocument(value), cancellationToken).ConfigureAwait(false);
             Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
             File.Move(temporaryPath, lockPath, overwrite: true);
             return value;
+        }
+        finally { _writeGate.Release(); }
+    }
+
+    public async ValueTask<SvnLock> RefreshLockAsync(SvnRepositoryPath path, string token, DateTimeOffset? expires, CancellationToken cancellationToken = default) {
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try {
+            await using var writerLock = AcquireWriterLock();
+            var lockPath = GetLockPath(path);
+            var current = await ReadLockAsync(lockPath, cancellationToken).ConfigureAwait(false) ?? throw new SvnLockException(path, "the path is not locked.");
+            if (current.Token != token) throw new SvnLockException(path, "the lock token does not match.");
+            var refreshed = current with { Expires = expires };
+            var temporaryPath = lockPath + ".tmp-" + Guid.NewGuid().ToString("N");
+            await WriteJsonAsync(temporaryPath, ToDocument(refreshed), cancellationToken).ConfigureAwait(false);
+            File.Move(temporaryPath, lockPath, overwrite: true);
+            return refreshed;
         }
         finally { _writeGate.Release(); }
     }
@@ -248,7 +268,7 @@ public sealed class SvnFileSystemRepository : ISvnWritableRepository
             await using var writerLock = AcquireWriterLock();
             var lockPath = GetLockPath(path);
             if (!File.Exists(lockPath)) { throw new SvnLockException(path, "the path is not locked."); }
-            var current = ToCore(await ReadJsonAsync<LockDocument>(lockPath, cancellationToken).ConfigureAwait(false));
+            var current = await ReadLockAsync(lockPath, cancellationToken).ConfigureAwait(false) ?? throw new SvnLockException(path, "the path is not locked.");
             if (!breakLock && !string.Equals(token, current.Token, StringComparison.Ordinal)) { throw new SvnLockException(path, "the lock token does not match."); }
             File.Delete(lockPath);
         }
@@ -257,15 +277,15 @@ public sealed class SvnFileSystemRepository : ISvnWritableRepository
 
     public async ValueTask<SvnLock?> GetLockAsync(SvnRepositoryPath path, CancellationToken cancellationToken = default) {
         var lockPath = GetLockPath(path);
-        return File.Exists(lockPath) ? ToCore(await ReadJsonAsync<LockDocument>(lockPath, cancellationToken).ConfigureAwait(false)) : null;
+        return await ReadLockAsync(lockPath, cancellationToken).ConfigureAwait(false);
     }
 
     public async IAsyncEnumerable<SvnLock> GetLocksAsync(SvnRepositoryPath path, [EnumeratorCancellation] CancellationToken cancellationToken = default) {
         var locksPath = Path.Combine(_rootPath, "locks");
         foreach (var file in Directory.EnumerateFiles(locksPath, "*.json", SearchOption.AllDirectories)) {
             cancellationToken.ThrowIfCancellationRequested();
-            var value = ToCore(await ReadJsonAsync<LockDocument>(file, cancellationToken).ConfigureAwait(false));
-            if (path.IsRoot || value.Path == path || value.Path.Value.StartsWith(path.Value + "/", StringComparison.Ordinal)) { yield return value; }
+            var value = await ReadLockAsync(file, cancellationToken).ConfigureAwait(false);
+            if (value is not null && (path.IsRoot || value.Path == path || value.Path.Value.StartsWith(path.Value + "/", StringComparison.Ordinal))) { yield return value; }
         }
     }
 
@@ -589,6 +609,16 @@ public sealed class SvnFileSystemRepository : ISvnWritableRepository
 
     private static string GetRevisionPropertiesPath(string rootPath, SvnRevision revision) =>
         Path.Combine(rootPath, "revprops", revision.Value.ToString("D6", CultureInfo.InvariantCulture) + ".json");
+
+    private static async ValueTask<SvnLock?> ReadLockAsync(string path, CancellationToken cancellationToken) {
+        if (!File.Exists(path)) return null;
+        SvnLock value;
+        try { value = ToCore(await ReadJsonAsync<LockDocument>(path, cancellationToken).ConfigureAwait(false)); }
+        catch (FileNotFoundException) { return null; }
+        if (value.Expires is not { } expires || expires > DateTimeOffset.UtcNow) return value;
+        try { File.Delete(path); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        return null;
+    }
 
     private string GetLockPath(SvnRepositoryPath path) => GetPhysicalPath(Path.Combine(_rootPath, "locks"), path) + ".json";
     private static LockDocument ToDocument(SvnLock value) => new() { Token = value.Token, Path = value.Path.Value, Owner = value.Owner, Comment = value.Comment, Created = value.Created, Expires = value.Expires };

@@ -25,26 +25,24 @@ internal static class SvnHttpServer {
                 case "PROPPATCH": await SvnHttpCommit.PropPatchAsync(context, repository, resource, options, transactions).ConfigureAwait(false); break;
                 case "PUT": await SvnHttpCommit.PutAsync(context, repository, resource, transactions).ConfigureAwait(false); break;
                 case "MERGE": await SvnHttpCommit.MergeAsync(context, repository, resource, options, transactions, RepositoryRoot(context)).ConfigureAwait(false); break;
-                case "DELETE": await SvnHttpCommit.DeleteAsync(context, repository, resource, transactions).ConfigureAwait(false); break;
+                case "DELETE": await SvnHttpCommit.DeleteAsync(context, repository, resource, options, transactions, RepositoryRoot(context)).ConfigureAwait(false); break;
                 case "MKCOL": await SvnHttpCommit.MakeCollectionAsync(context, repository, resource, transactions).ConfigureAwait(false); break;
                 case "COPY": await SvnHttpCommit.CopyAsync(context, repository, resource, options, transactions, RepositoryRoot(context)).ConfigureAwait(false); break;
                 case "LOCK": await SvnHttpLock.LockAsync(context, repository, resource, options).ConfigureAwait(false); break;
                 case "UNLOCK": await SvnHttpLock.UnlockAsync(context, repository, resource).ConfigureAwait(false); break;
                 default: context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; break;
             }
-        } catch (BadHttpRequestException exception) { detail = exception.Message; context.Response.StatusCode = exception.StatusCode; }
-        catch (SvnPathNotFoundException exception) { detail = exception.Message; context.Response.StatusCode = StatusCodes.Status404NotFound; }
-        catch (SvnInvalidRevisionException exception) { detail = exception.Message; context.Response.StatusCode = StatusCodes.Status404NotFound; }
-        catch (SvnOutOfDateException exception) {
-            detail = exception.Message;
-            await SvnDavXml.WriteErrorAsync(context.Response, StatusCodes.Status409Conflict, 160028, exception.Message, context.RequestAborted).ConfigureAwait(false);
+        } catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) {
+            detail = "request cancelled";
+            if (!context.Response.HasStarted) context.Response.StatusCode = 499;
+        } catch (Exception exception) {
+            detail = exception.GetType().Name + ": " + exception.Message;
+            if (context.Response.HasStarted) return;
+            if (SvnHttpErrors.TryMap(exception, out var statusCode, out var errorCode))
+                await SvnDavXml.WriteErrorAsync(context.Response, statusCode, errorCode, exception.Message, context.RequestAborted).ConfigureAwait(false);
+            else
+                await SvnDavXml.WriteErrorAsync(context.Response, StatusCodes.Status500InternalServerError, 200000, "Internal server error.", context.RequestAborted).ConfigureAwait(false);
         }
-        catch (SvnLockException exception) {
-            detail = exception.Message;
-            await SvnDavXml.WriteErrorAsync(context.Response, StatusCodes.Status423Locked, 160035, exception.Message, context.RequestAborted).ConfigureAwait(false);
-        }
-        catch (SvnHttpTransactionNotFoundException) { context.Response.StatusCode = StatusCodes.Status404NotFound; }
-        catch (Exception exception) { detail = exception.ToString(); context.Response.StatusCode = StatusCodes.Status500InternalServerError; throw; }
         finally {
             if (detail is null && context.Items.TryGetValue("SvnFlux.Http.Trace", out var traceDetail)) detail = traceDetail?.ToString();
             options.Trace?.Invoke(new(context.Request.Method, context.Request.Path, context.Response.StatusCode, detail));

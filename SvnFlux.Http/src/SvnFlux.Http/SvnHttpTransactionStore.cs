@@ -7,14 +7,27 @@ using SvnFlux.Svndiff;
 
 namespace SvnFlux.Http;
 
-internal sealed class SvnHttpTransactionStore {
+internal sealed class SvnHttpTransactionStore : IAsyncDisposable {
     private readonly ConcurrentDictionary<(Guid Repository, string Id), SvnHttpTransaction> _transactions = new();
+    private static readonly string Root = Path.Combine(Path.GetTempPath(), "svnflux-http");
+    private readonly string _sessionDirectory;
+    private readonly FileStream _lease;
+
+    public SvnHttpTransactionStore() {
+        Directory.CreateDirectory(Root);
+        CleanupOrphans();
+        _sessionDirectory = Path.Combine(Root, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_sessionDirectory);
+        _lease = new(Path.Combine(_sessionDirectory, "owner.lock"), FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+    }
+
 
     public async ValueTask<SvnHttpTransaction> CreateAsync(ISvnWritableRepository repository, string? author, SvnHttpOptions options, CancellationToken token) {
         RemoveExpired(options.TransactionIdleTimeout);
         if (_transactions.Count >= options.MaximumActiveTransactions) throw new BadHttpRequestException("The maximum number of active SVN transactions has been reached.", StatusCodes.Status503ServiceUnavailable);
         var id = Guid.NewGuid().ToString("N");
-        var transaction = new SvnHttpTransaction(id, repository, await repository.GetLatestRevisionAsync(token).ConfigureAwait(false), author, options.MaximumPutSize);
+        var directory = Path.Combine(_sessionDirectory, repository.Id.ToString("N"), id);
+        var transaction = new SvnHttpTransaction(id, repository, await repository.GetLatestRevisionAsync(token).ConfigureAwait(false), author, options.MaximumPutSize, directory);
         if (!_transactions.TryAdd((repository.Id, id), transaction)) throw new InvalidOperationException("Could not allocate a unique transaction identifier.");
         return transaction;
     }
@@ -36,6 +49,30 @@ internal sealed class SvnHttpTransactionStore {
             if (_transactions.TryRemove(pair.Key, out var transaction)) _ = transaction.DisposeAsync();
         }
     }
+
+    private static void CleanupOrphans() {
+        foreach (var directory in Directory.EnumerateDirectories(Root)) {
+            var leasePath = Path.Combine(directory, "owner.lock");
+            if (!File.Exists(leasePath)) { TryDeleteDirectory(directory); continue; }
+            try {
+                using var lease = new FileStream(leasePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                TryDeleteDirectory(directory);
+            } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    private static void TryDeleteDirectory(string path) {
+        try { if (Directory.Exists(path)) Directory.Delete(path, true); }
+        catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
+
+    public async ValueTask DisposeAsync() {
+        foreach (var pair in _transactions.ToArray()) {
+            if (_transactions.TryRemove(pair.Key, out var transaction)) await transaction.DisposeAsync().ConfigureAwait(false);
+        }
+        await _lease.DisposeAsync().ConfigureAwait(false);
+        TryDeleteDirectory(_sessionDirectory);
+    }
 }
 
 internal sealed class SvnHttpTransaction : IAsyncDisposable {
@@ -47,15 +84,15 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
     private readonly List<StructuralChange> _structuralChanges = [];
     private readonly Dictionary<SvnRepositoryPath, List<SvnHttpPropertyChange>> _nodeProperties = [];
     private readonly long _maximumFileSize;
-    private bool _closed;
+    private TransactionState _state;
 
-    public SvnHttpTransaction(string id, ISvnWritableRepository repository, SvnRevision baseRevision, string? author, long maximumFileSize) {
+    public SvnHttpTransaction(string id, ISvnWritableRepository repository, SvnRevision baseRevision, string? author, long maximumFileSize, string directory) {
         Id = id;
         Repository = repository;
         BaseRevision = baseRevision;
         Author = author;
         _maximumFileSize = maximumFileSize;
-        _directory = Path.Combine(Path.GetTempPath(), "svnflux-http", repository.Id.ToString("N"), id);
+        _directory = directory;
         Directory.CreateDirectory(_directory);
         LastAccess = DateTimeOffset.UtcNow;
     }
@@ -70,6 +107,10 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
 
     public void AddLockToken(SvnRepositoryPath path, string? header) {
         if (SvnHttpLock.TryReadToken(header, out var token)) _lockTokens[path] = token;
+    }
+
+    public void AddLockTokens(IEnumerable<KeyValuePair<SvnRepositoryPath, string>> values) {
+        foreach (var pair in values) _lockTokens[pair.Key] = pair.Value;
     }
 
     public async ValueTask<(bool Added, string Checksum)> PutFileAsync(SvnRepositoryPath path, HttpRequest request, CancellationToken token) {
@@ -116,7 +157,7 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
             EnsureOpen();
             var root = await Repository.OpenRevisionAsync(BaseRevision, token).ConfigureAwait(false);
             if (await root.GetNodeInfoAsync(path, token).ConfigureAwait(false) is not null || ExistsInTransaction(path))
-                throw new InvalidOperationException($"Path '{path}' already exists.");
+                throw new SvnHttpProtocolException(StatusCodes.Status409Conflict, 160020, $"Path '{path}' already exists.");
             _structuralChanges.Add(new(SvnCommitChangeAction.Add, path, SvnNodeKind.Directory, null));
             Touch();
         } finally { _mutex.Release(); }
@@ -130,7 +171,7 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
             var source = await sourceRoot.GetNodeInfoAsync(sourcePath, token).ConfigureAwait(false) ?? throw new SvnPathNotFoundException(sourcePath);
             var transactionRoot = await Repository.OpenRevisionAsync(BaseRevision, token).ConfigureAwait(false);
             if (await transactionRoot.GetNodeInfoAsync(targetPath, token).ConfigureAwait(false) is not null || ExistsInTransaction(targetPath))
-                throw new InvalidOperationException($"Path '{targetPath}' already exists.");
+                throw new SvnHttpProtocolException(StatusCodes.Status409Conflict, 160020, $"Path '{targetPath}' already exists.");
             _structuralChanges.Add(new(SvnCommitChangeAction.Copy, targetPath, source.Kind, new(sourcePath, sourceRevision)));
             Touch();
         } finally { _mutex.Release(); }
@@ -181,6 +222,7 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
         await _mutex.WaitAsync(token).ConfigureAwait(false);
         try {
             EnsureOpen();
+            _state = TransactionState.Committing;
             var changes = new List<SvnCommitChange>();
             var propertiesUsed = new HashSet<SvnRepositoryPath>();
             foreach (var change in _structuralChanges) {
@@ -215,9 +257,9 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
             var properties = RevisionProperties();
             var request = new SvnCommitRequest(BaseRevision, properties, changes) { LockTokens = _lockTokens, KeepLocks = keepLocks };
             var revision = await Repository.CommitAsync(request, token).ConfigureAwait(false);
-            _closed = true;
+            _state = TransactionState.Committed;
             return (revision, properties);
-        } finally { _mutex.Release(); }
+        } catch { if (_state == TransactionState.Committing) _state = TransactionState.Open; throw; } finally { _mutex.Release(); }
     }
 
     private SvnRevisionProperties RevisionProperties() {
@@ -265,20 +307,25 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
     private static string ValidateChecksum(string? expected, string path) {
         using var stream = File.OpenRead(path);
         var actual = Convert.ToHexStringLower(MD5.HashData(stream));
-        if (!string.IsNullOrEmpty(expected) && !actual.Equals(expected, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("The PUT result checksum does not match the reconstructed file.");
+        if (!string.IsNullOrEmpty(expected) && !actual.Equals(expected, StringComparison.OrdinalIgnoreCase))
+            throw new SvnHttpProtocolException(StatusCodes.Status400BadRequest, 200014, "The PUT result checksum does not match the reconstructed file.");
         return actual;
     }
 
     private static FileStream OpenStaged(string path) => new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
     private static void TryDelete(string path) { try { File.Delete(path); } catch (IOException) { } catch (UnauthorizedAccessException) { } }
-    private void EnsureOpen() { if (_closed) throw new InvalidOperationException("The SVN transaction is already closed."); }
+    private void EnsureOpen() { if (_state != TransactionState.Open) throw new SvnHttpTransactionStateException(_state.ToString()); }
 
-    public ValueTask DisposeAsync() {
-        _closed = true;
-        _mutex.Dispose();
-        try { if (Directory.Exists(_directory)) Directory.Delete(_directory, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-        return ValueTask.CompletedTask;
+    public async ValueTask DisposeAsync() {
+        await _mutex.WaitAsync().ConfigureAwait(false);
+        try {
+            if (_state == TransactionState.Open) _state = TransactionState.Aborted;
+            try { if (Directory.Exists(_directory)) Directory.Delete(_directory, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        } finally { _mutex.Release(); _mutex.Dispose(); }
     }
+
+
+    private enum TransactionState { Open, Committing, Committed, Aborted }
 
     private sealed record StagedFile(string Path, bool Added);
 
@@ -309,3 +356,7 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
 }
 
 internal sealed class SvnHttpTransactionNotFoundException : Exception;
+
+internal sealed class SvnHttpTransactionStateException(string state) : Exception($"The SVN transaction is {state.ToLowerInvariant()}.") {
+    public string State { get; } = state;
+}

@@ -8,7 +8,7 @@ using SvnFlux.Svndiff;
 
 namespace SvnFlux.Http;
 
-internal sealed record SvnHttpUpdateEntry(SvnRepositoryPath Path, SvnRevision Revision, bool StartEmpty, string Depth, SvnRepositoryPath? LinkPath);
+internal sealed record SvnHttpUpdateEntry(SvnRepositoryPath Path, SvnRevision Revision, bool StartEmpty, string Depth, SvnRepositoryPath? LinkPath, string? LockToken = null);
 internal sealed record SvnHttpUpdateRequest(string SourcePath, string? DestinationPath, SvnRevision? TargetRevision, SvnRepositoryPath UpdateTarget,
     string Depth, bool SendAll, bool SendCopyFromArguments, bool TextDeltas, IReadOnlyList<SvnHttpUpdateEntry> Entries, IReadOnlySet<SvnRepositoryPath> MissingPaths);
 
@@ -66,7 +66,8 @@ internal static class SvnHttpUpdateReport {
                     var startEmpty = string.Equals(reader.GetAttribute("start-empty"), "true", StringComparison.OrdinalIgnoreCase);
                     var entryDepth = reader.GetAttribute("depth") ?? "infinity";
                     SvnRepositoryPath? linkPath = reader.GetAttribute("linkpath") is { Length: > 0 } value ? new(value) : null;
-                    entries.Add(new(new(await reader.ReadElementContentAsStringAsync().ConfigureAwait(false)), revision, startEmpty, entryDepth, linkPath));
+                    var lockToken = reader.GetAttribute("lock-token");
+                    entries.Add(new(new(await reader.ReadElementContentAsStringAsync().ConfigureAwait(false)), revision, startEmpty, entryDepth, linkPath, lockToken));
                     continue;
                 case "missing": missing.Add(new(await reader.ReadElementContentAsStringAsync().ConfigureAwait(false))); continue;
             }
@@ -100,8 +101,10 @@ internal static class SvnHttpUpdateReport {
         var baseRoot = await repository.OpenRevisionAsync(rootEntry.Revision, token).ConfigureAwait(false);
         var targetRoot = await repository.OpenRevisionAsync(targetRevision, token).ConfigureAwait(false);
         var targetTree = await ReadTreeAsync(targetRoot, targetAnchor, token).ConfigureAwait(false);
+        await ApplyRepositoryLocksAsync(repository, targetTree, targetAnchor, request.Entries, token).ConfigureAwait(false);
         var baseTree = rootEntry.StartEmpty ? EmptyTree(baseRoot, baseAnchor, targetTree[""]) : await ReadTreeAsync(baseRoot, baseAnchor, token).ConfigureAwait(false);
         await ApplyReportOverridesAsync(repository, baseTree, targetTree, request.Entries, request.MissingPaths, baseAnchor, targetRevision, token).ConfigureAwait(false);
+        ApplyReportedLocks(baseTree, request.Entries);
         RestrictToScope(baseTree, request.UpdateTarget.Value);
         RestrictToScope(targetTree, request.UpdateTarget.Value);
         RestrictToDepth(baseTree, request.UpdateTarget.Value, request.Depth);
@@ -127,7 +130,7 @@ internal static class SvnHttpUpdateReport {
         if (request.UpdateTarget.IsRoot) {
             WriteCheckedIn(writer, targetTree[""], revisionRootStub);
             WritePropertyChanges(writer, baseTree[""].Properties, targetTree[""].Properties);
-            WriteEntryProperties(writer, targetTree[""], repository.Id);
+            WriteEntryProperties(writer, targetTree[""], repository.Id, baseTree[""].LockToken);
         }
         var operations = new List<string>();
         await WriteDirectoryAsync(writer, "", baseTree, targetTree, revisionRootStub, repository, request.SendCopyFromArguments,
@@ -166,7 +169,7 @@ internal static class SvnHttpUpdateReport {
                 if (oldNode is null || InScope(path, scope)) {
                     WriteCheckedIn(writer, newNode, revisionRootStub);
                     WritePropertyChanges(writer, oldNode?.Properties ?? SvnPropertyCollection.Empty, newNode.Properties);
-                    WriteEntryProperties(writer, newNode, repository.Id);
+                    WriteEntryProperties(writer, newNode, repository.Id, oldNode?.LockToken);
                 }
                 operations.Add((oldNode is null ? "add-dir " : "open-dir ") + path);
                 await WriteDirectoryAsync(writer, path, baseTree, targetTree, revisionRootStub, repository, copyFrom, textDeltas, version, scope, operations, token).ConfigureAwait(false);
@@ -186,7 +189,7 @@ internal static class SvnHttpUpdateReport {
         else if (copyFrom) await WriteCopyFromAsync(writer, repository, newNode, token).ConfigureAwait(false);
         WriteCheckedIn(writer, newNode, revisionRootStub);
         WritePropertyChanges(writer, oldNode?.Properties ?? SvnPropertyCollection.Empty, newNode.Properties);
-        WriteEntryProperties(writer, newNode, repository.Id);
+        WriteEntryProperties(writer, newNode, repository.Id, oldNode?.LockToken);
         if (oldNode is not null && await FileContentsEqualAsync(oldNode, newNode, token).ConfigureAwait(false)) {
             writer.WriteEndElement();
             return;
@@ -251,12 +254,14 @@ internal static class SvnHttpUpdateReport {
     }
 
 
-    private static void WriteEntryProperties(XmlWriter writer, Node node, Guid repositoryId) {
+    private static void WriteEntryProperties(XmlWriter writer, Node node, Guid repositoryId, string? previousLockToken) {
         WriteProperty(writer, "svn:entry:committed-rev", Encoding.UTF8.GetBytes(node.Info.LastChangedRevision.Value.ToString(CultureInfo.InvariantCulture)));
         WriteProperty(writer, "svn:entry:uuid", Encoding.UTF8.GetBytes(repositoryId.ToString()));
         if (node.Info.LastChangedTime is { } time)
             WriteProperty(writer, "svn:entry:committed-date", Encoding.UTF8.GetBytes(time.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'", CultureInfo.InvariantCulture)));
         if (node.Info.LastChangedAuthor is { } author) WriteProperty(writer, "svn:entry:last-author", Encoding.UTF8.GetBytes(author));
+        if (node.LockToken is not null) WriteProperty(writer, "svn:entry:lock-token", Encoding.UTF8.GetBytes(node.LockToken));
+        else if (previousLockToken is not null) Empty(writer, "remove-prop", ("name", "svn:entry:lock-token"));
     }
     private static void WritePropertyChanges(XmlWriter writer, SvnPropertyCollection oldProperties, SvnPropertyCollection newProperties) {
         var oldMap = oldProperties.ToDictionary(property => property.Name, StringComparer.Ordinal);
@@ -287,6 +292,7 @@ internal static class SvnHttpUpdateReport {
 
     private static async ValueTask<bool> NodesEqualAsync(Node left, Node right, CancellationToken token) {
         if (!PropertiesEqual(left.Properties, right.Properties)) return false;
+        if (!string.Equals(left.LockToken, right.LockToken, StringComparison.Ordinal)) return false;
         if (left.Info.LastChangedRevision != right.Info.LastChangedRevision || left.Info.LastChangedTime != right.Info.LastChangedTime ||
             !string.Equals(left.Info.LastChangedAuthor, right.Info.LastChangedAuthor, StringComparison.Ordinal)) return false;
         return await FileContentsEqualAsync(left, right, token).ConfigureAwait(false);
@@ -309,6 +315,24 @@ internal static class SvnHttpUpdateReport {
         if (left.Count != right.Count) return false;
         var map = right.ToDictionary(property => property.Name, StringComparer.Ordinal);
         return left.All(property => map.TryGetValue(property.Name, out var other) && property.Value.Span.SequenceEqual(other.Value.Span));
+    }
+
+    private static async ValueTask ApplyRepositoryLocksAsync(ISvnRepository repository, Dictionary<string, Node> tree, SvnRepositoryPath anchor,
+        IReadOnlyList<SvnHttpUpdateEntry> entries, CancellationToken token) {
+        if (repository is not ISvnWritableRepository writable) return;
+        foreach (var entry in entries.Where(entry => entry.LockToken is not null)) {
+            var path = entry.Path.IsRoot ? anchor : anchor.Append(entry.Path);
+            var current = await writable.GetLockAsync(path, token).ConfigureAwait(false);
+            if (current?.Token == entry.LockToken! && tree.TryGetValue(entry.Path.Value, out var node))
+                tree[entry.Path.Value] = node with { LockToken = current.Token };
+        }
+    }
+
+    private static void ApplyReportedLocks(Dictionary<string, Node> tree, IReadOnlyList<SvnHttpUpdateEntry> entries) {
+        foreach (var entry in entries) {
+            if (entry.LockToken is null || !tree.TryGetValue(entry.Path.Value, out var node)) continue;
+            tree[entry.Path.Value] = node with { LockToken = entry.LockToken };
+        }
     }
 
     private static async ValueTask<Dictionary<string, Node>> ReadTreeAsync(ISvnRevisionRoot root, SvnRepositoryPath anchor, CancellationToken token) {
@@ -398,7 +422,7 @@ internal static class SvnHttpUpdateReport {
         writer.WriteEndElement();
     }
 
-    private sealed record Node(ISvnRevisionRoot Root, SvnRepositoryPath Path, SvnNodeInfo Info, SvnPropertyCollection Properties, bool IsReportedTarget = false);
+    private sealed record Node(ISvnRevisionRoot Root, SvnRepositoryPath Path, SvnNodeInfo Info, SvnPropertyCollection Properties, bool IsReportedTarget = false, string? LockToken = null);
 
     private sealed class Base64XmlWriter {
         private readonly XmlWriter _writer;

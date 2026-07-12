@@ -74,8 +74,9 @@ internal static class SvnHttpCommit {
 
     internal static async Task MergeAsync(HttpContext context, ISvnRepository repository, SvnHttpResource resource, SvnHttpOptions options, SvnHttpTransactionStore store, string repositoryRoot) {
         if (resource.Kind != SvnHttpResourceKind.Public || repository is not ISvnWritableRepository) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
-        var id = await ReadMergeTransactionAsync(context.Request, repositoryRoot, options.SpecialResourceSegment, options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false);
-        var transaction = store.Get(repository, id);
+        var merge = await ReadMergeTransactionAsync(context.Request, repositoryRoot, options.SpecialResourceSegment, options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false);
+        var transaction = store.Get(repository, merge.TransactionId);
+        transaction.AddLockTokens(merge.LockTokens);
         var keepLocks = !context.Request.Headers["X-SVN-Options"].Any(value => value?.Contains("release-locks", StringComparison.OrdinalIgnoreCase) == true);
         var result = await transaction.CommitAsync(keepLocks, context.RequestAborted).ConfigureAwait(false);
         try {
@@ -83,7 +84,7 @@ internal static class SvnHttpCommit {
         } finally { await store.RemoveAsync(transaction).ConfigureAwait(false); }
     }
 
-    internal static async Task DeleteAsync(HttpContext context, ISvnRepository repository, SvnHttpResource resource, SvnHttpTransactionStore store) {
+    internal static async Task DeleteAsync(HttpContext context, ISvnRepository repository, SvnHttpResource resource, SvnHttpOptions options, SvnHttpTransactionStore store, string repositoryRoot) {
         if (resource.Kind == SvnHttpResourceKind.Transaction) {
             var transaction = store.Get(repository, resource.TransactionId!);
             await store.RemoveAsync(transaction).ConfigureAwait(false);
@@ -94,7 +95,9 @@ internal static class SvnHttpCommit {
         var revision = SvnHttpTransaction.ReadBaseRevision(context.Request.Headers["X-SVN-Version-Name"]) ??
             throw new BadHttpRequestException("DELETE requires X-SVN-Version-Name.");
         var pending = store.Get(repository, resource.TransactionId!);
+        pending.AddLockTokens(await SvnHttpLock.ReadTokenListAsync(context.Request, options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false));
         pending.AddLockToken(resource.Path, context.Request.Headers["If"]);
+        pending.AddLockTokens(SvnHttpLock.ReadIfTokens(context.Request.Headers["If"], repositoryRoot));
         await pending.DeleteAsync(resource.Path, revision, context.RequestAborted).ConfigureAwait(false);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
@@ -112,23 +115,40 @@ internal static class SvnHttpCommit {
         return resource;
     }
 
-    private static async ValueTask<string> ReadMergeTransactionAsync(HttpRequest request, string repositoryRoot, string specialSegment, long maximumSize, CancellationToken token) {
+    private static async ValueTask<MergeRequest> ReadMergeTransactionAsync(HttpRequest request, string repositoryRoot, string specialSegment, long maximumSize, CancellationToken token) {
         if (request.ContentLength > maximumSize) throw new BadHttpRequestException("The MERGE body is too large.", StatusCodes.Status413PayloadTooLarge);
         var settings = new XmlReaderSettings { Async = true, DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, MaxCharactersInDocument = maximumSize };
         using var reader = XmlReader.Create(request.Body, settings);
+        var root = repositoryRoot.TrimEnd('/');
+        var locks = new Dictionary<SvnRepositoryPath, string>();
+        string? transactionId = null;
+        string? lockPath = null;
         while (await reader.ReadAsync().ConfigureAwait(false)) {
             token.ThrowIfCancellationRequested();
-            if (reader.NodeType != XmlNodeType.Element || reader.NamespaceURI != SvnDavXml.Dav || reader.LocalName != "href") continue;
-            var href = await reader.ReadElementContentAsStringAsync().ConfigureAwait(false);
-            var path = Uri.TryCreate(href, UriKind.Absolute, out var uri) ? uri.AbsolutePath : href;
-            var root = repositoryRoot.TrimEnd('/');
-            if (!path.StartsWith(root + "/", StringComparison.Ordinal)) throw new BadHttpRequestException("The MERGE source is outside this repository.");
-            var relative = path[(root.Length + 1)..];
-            if (SvnHttpResource.TryParse(relative, specialSegment, out var resource) && resource.Kind == SvnHttpResourceKind.Transaction)
-                return resource.TransactionId!;
+            if (reader.NodeType != XmlNodeType.Element) continue;
+            if (reader.NamespaceURI == SvnDavXml.Dav && reader.LocalName == "href" && transactionId is null) {
+                var href = await reader.ReadElementContentAsStringAsync().ConfigureAwait(false);
+                var path = Uri.TryCreate(href, UriKind.Absolute, out var uri) ? uri.AbsolutePath : href;
+                if (!path.StartsWith(root + "/", StringComparison.Ordinal)) throw new BadHttpRequestException("The MERGE source is outside this repository.");
+                var relative = path[(root.Length + 1)..];
+                if (SvnHttpResource.TryParse(relative, specialSegment, out var resource) && resource.Kind == SvnHttpResourceKind.Transaction)
+                    transactionId = resource.TransactionId;
+                continue;
+            }
+            if (reader.LocalName == "lock-path") {
+                lockPath = await reader.ReadElementContentAsStringAsync().ConfigureAwait(false);
+                continue;
+            }
+            if (reader.LocalName == "lock-token" && lockPath is not null) {
+                var lockToken = await reader.ReadElementContentAsStringAsync().ConfigureAwait(false);
+                locks[new(lockPath.TrimStart('/'))] = lockToken;
+                lockPath = null;
+            }
         }
-        throw new BadHttpRequestException("The MERGE request has no transaction source.");
+        return transactionId is null ? throw new BadHttpRequestException("The MERGE request has no transaction source.") : new(transactionId, locks);
     }
+
+    private sealed record MergeRequest(string TransactionId, IReadOnlyDictionary<SvnRepositoryPath, string> LockTokens);
 
     private static async Task WriteMergeResponseAsync(HttpResponse response, string repositoryRoot, SvnRevision revision, SvnRevisionProperties properties, CancellationToken token) {
         response.StatusCode = StatusCodes.Status200OK;

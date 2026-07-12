@@ -69,16 +69,27 @@ public sealed class SvnMemoryRepository : ISvnWritableRepository {
         if (node.Kind != SvnNodeKind.File) throw new SvnLockException(request.Path, "only files can be locked.");
         if (request.CurrentRevision is { } r && node.Changed.Value > r.Value) throw new SvnOutOfDateException(r, node.Changed);
         lock (_lockGate) {
+            PurgeExpiredLocks();
             if (_locks.ContainsKey(request.Path) && !request.StealLock) throw new SvnLockException(request.Path, "already locked.");
-            var value = new SvnLock("opaquelocktoken:" + Guid.NewGuid(), request.Path, request.Owner, request.Comment, DateTimeOffset.UtcNow); _locks[request.Path] = value; return ValueTask.FromResult(value);
+            var value = new SvnLock("opaquelocktoken:" + Guid.NewGuid(), request.Path, request.Owner, request.Comment, DateTimeOffset.UtcNow, request.Expires);
+            _locks[request.Path] = value; return ValueTask.FromResult(value);
+        }
+    }
+    public ValueTask<SvnLock> RefreshLockAsync(SvnRepositoryPath path, string token, DateTimeOffset? expires, CancellationToken cancellationToken = default) {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lockGate) {
+            PurgeExpiredLocks();
+            var current = _locks.GetValueOrDefault(path) ?? throw new SvnLockException(path, "not locked.");
+            if (current.Token != token) throw new SvnLockException(path, "token mismatch.");
+            var refreshed = current with { Expires = expires }; _locks[path] = refreshed; return ValueTask.FromResult(refreshed);
         }
     }
     public ValueTask UnlockAsync(SvnRepositoryPath path, string? token, bool breakLock, CancellationToken cancellationToken = default) {
-        lock (_lockGate) { var value = _locks.GetValueOrDefault(path) ?? throw new SvnLockException(path, "not locked."); if (!breakLock && value.Token != token) throw new SvnLockException(path, "token mismatch."); _locks.Remove(path); return ValueTask.CompletedTask; }
+        lock (_lockGate) { PurgeExpiredLocks(); var value = _locks.GetValueOrDefault(path) ?? throw new SvnLockException(path, "not locked."); if (!breakLock && value.Token != token) throw new SvnLockException(path, "token mismatch."); _locks.Remove(path); return ValueTask.CompletedTask; }
     }
-    public ValueTask<SvnLock?> GetLockAsync(SvnRepositoryPath path, CancellationToken token = default) { token.ThrowIfCancellationRequested(); lock (_lockGate) return ValueTask.FromResult(_locks.GetValueOrDefault(path)); }
+    public ValueTask<SvnLock?> GetLockAsync(SvnRepositoryPath path, CancellationToken token = default) { token.ThrowIfCancellationRequested(); lock (_lockGate) { PurgeExpiredLocks(); return ValueTask.FromResult(_locks.GetValueOrDefault(path)); } }
     public async IAsyncEnumerable<SvnLock> GetLocksAsync(SvnRepositoryPath path, [EnumeratorCancellation] CancellationToken token = default) {
-        SvnLock[] values; lock (_lockGate) values = _locks.Values.Where(x => path.IsRoot || x.Path == path || x.Path.Value.StartsWith(path.Value + "/", StringComparison.Ordinal)).ToArray();
+        SvnLock[] values; lock (_lockGate) { PurgeExpiredLocks(); values = _locks.Values.Where(x => path.IsRoot || x.Path == path || x.Path.Value.StartsWith(path.Value + "/", StringComparison.Ordinal)).ToArray(); }
         foreach (var value in values) { token.ThrowIfCancellationRequested(); yield return value; await Task.Yield(); }
     }
 
@@ -109,7 +120,18 @@ public sealed class SvnMemoryRepository : ISvnWritableRepository {
         Props(node!, change.PropertyChanges); node!.Changed = revision; log.Add(new(change.Path, exists ? SvnChangeAction.Modify : SvnChangeAction.Add, change.NodeKind, text, change.PropertyChanges.Count > 0)); Touch(nodes, change.Path, revision);
     }
 
-    private void ValidateLocks(SvnCommitRequest request) { lock (_lockGate) foreach (var change in request.Changes) if (_locks.TryGetValue(change.Path, out var value) && request.LockTokens.GetValueOrDefault(change.Path) != value.Token) throw new SvnLockException(change.Path, "matching token required."); }
+    private void ValidateLocks(SvnCommitRequest request) {
+        lock (_lockGate) {
+            PurgeExpiredLocks();
+            foreach (var change in request.Changes)
+                foreach (var value in _locks.Values.Where(value => value.Path == change.Path ||
+                    change.Action == SvnCommitChangeAction.Delete && change.NodeKind == SvnNodeKind.Directory && value.Path.Value.StartsWith(change.Path.Value + "/", StringComparison.Ordinal)))
+                    if (request.LockTokens.GetValueOrDefault(value.Path) != value.Token) throw new SvnLockException(value.Path, "matching token required.");
+        }
+    }
+    private void PurgeExpiredLocks() {
+        foreach (var path in _locks.Where(pair => pair.Value.Expires is { } expires && expires <= DateTimeOffset.UtcNow).Select(pair => pair.Key).ToArray()) _locks.Remove(path);
+    }
     private static async ValueTask<byte[]> Body(SvnCommitChange change, CancellationToken token) { await using var source = await change.OpenContentAsync(token); using var target = new MemoryStream(); await source.CopyToAsync(target, token); return target.ToArray(); }
     private static void Parents(Dictionary<string, Node> nodes, SvnRepositoryPath path, SvnRevision revision) { var parts = path.Value.Split('/'); for (var n = 1; n < parts.Length; n++) { var p = string.Join('/', parts.Take(n)); if (!nodes.ContainsKey(p)) nodes[p] = new(SvnNodeKind.Directory, null, [], revision); else if (nodes[p].Kind != SvnNodeKind.Directory) throw new SvnNodeKindMismatchException(new(p), SvnNodeKind.Directory); } }
     private static void Touch(Dictionary<string, Node> nodes, SvnRepositoryPath path, SvnRevision revision) { nodes[""].Changed = revision; var parts = path.Value.Split('/'); for (var n = 1; n < parts.Length; n++) nodes[string.Join('/', parts.Take(n))].Changed = revision; }
