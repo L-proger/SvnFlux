@@ -19,9 +19,24 @@ internal static class SvnHttpCommit {
     }
 
     internal static async Task PropPatchAsync(HttpContext context, ISvnRepository repository, SvnHttpResource resource, SvnHttpOptions options, SvnHttpTransactionStore store) {
-        if (resource.Kind is not (SvnHttpResourceKind.Transaction or SvnHttpResourceKind.TransactionRoot)) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
-        var transaction = store.Get(repository, resource.TransactionId!);
+        if (resource.Kind is not (SvnHttpResourceKind.Revision or SvnHttpResourceKind.Transaction or SvnHttpResourceKind.TransactionRoot)) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
         var changes = await SvnHttpPropertyUpdate.ReadAsync(context.Request, options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false);
+        if (resource.Kind == SvnHttpResourceKind.Revision) {
+            if (repository is not ISvnWritableRepository writable) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
+            try {
+                foreach (var change in changes)
+                    await writable.ChangeRevisionPropertyAsync(new(resource.Revision!.Value, change.Name,
+                        Bytes(change.Value), !change.HasExpectedValue, Bytes(change.ExpectedValue)), context.RequestAborted).ConfigureAwait(false);
+            } catch (SvnRevisionPropertyConflictException) {
+                await SvnHttpPropertyUpdate.WriteResponseAsync(context.Response, context.Request.Path, context.RequestAborted, StatusCodes.Status412PreconditionFailed).ConfigureAwait(false);
+                return;
+            }
+            context.Items["SvnFlux.Http.Trace"] = "revision-properties=" + string.Join(", ", changes.Select(change => $"{change.Name}:{(change.Value is null ? "delete" : "bytes=" + change.Value.Length)}:expected={change.HasExpectedValue}"));
+            await SvnHttpPropertyUpdate.WriteResponseAsync(context.Response, context.Request.Path, context.RequestAborted).ConfigureAwait(false);
+            return;
+        }
+        var transaction = store.Get(repository, resource.TransactionId!);
+        if (resource.Kind == SvnHttpResourceKind.TransactionRoot) transaction.AddLockToken(resource.Path, context.Request.Headers["If"]);
         if (resource.Kind == SvnHttpResourceKind.Transaction)
             await transaction.SetRevisionPropertiesAsync(changes, context.RequestAborted).ConfigureAwait(false);
         else
@@ -35,6 +50,7 @@ internal static class SvnHttpCommit {
         if (resource.Kind != SvnHttpResourceKind.TransactionRoot) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
         var transaction = store.Get(repository, resource.TransactionId!);
         var result = await transaction.PutFileAsync(resource.Path, context.Request, context.RequestAborted).ConfigureAwait(false);
+        transaction.AddLockToken(resource.Path, context.Request.Headers["If"]);
         context.Response.Headers.Append("X-SVN-Result-Fulltext-MD5", result.Checksum);
         context.Response.StatusCode = result.Added ? StatusCodes.Status201Created : StatusCodes.Status204NoContent;
     }
@@ -60,7 +76,8 @@ internal static class SvnHttpCommit {
         if (resource.Kind != SvnHttpResourceKind.Public || repository is not ISvnWritableRepository) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
         var id = await ReadMergeTransactionAsync(context.Request, repositoryRoot, options.SpecialResourceSegment, options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false);
         var transaction = store.Get(repository, id);
-        var result = await transaction.CommitAsync(context.RequestAborted).ConfigureAwait(false);
+        var keepLocks = !context.Request.Headers["X-SVN-Options"].Any(value => value?.Contains("release-locks", StringComparison.OrdinalIgnoreCase) == true);
+        var result = await transaction.CommitAsync(keepLocks, context.RequestAborted).ConfigureAwait(false);
         try {
             await WriteMergeResponseAsync(context.Response, repositoryRoot, result.Revision, result.Properties, context.RequestAborted).ConfigureAwait(false);
         } finally { await store.RemoveAsync(transaction).ConfigureAwait(false); }
@@ -76,9 +93,14 @@ internal static class SvnHttpCommit {
         if (resource.Kind != SvnHttpResourceKind.TransactionRoot) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
         var revision = SvnHttpTransaction.ReadBaseRevision(context.Request.Headers["X-SVN-Version-Name"]) ??
             throw new BadHttpRequestException("DELETE requires X-SVN-Version-Name.");
-        await store.Get(repository, resource.TransactionId!).DeleteAsync(resource.Path, revision, context.RequestAborted).ConfigureAwait(false);
+        var pending = store.Get(repository, resource.TransactionId!);
+        pending.AddLockToken(resource.Path, context.Request.Headers["If"]);
+        await pending.DeleteAsync(resource.Path, revision, context.RequestAborted).ConfigureAwait(false);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
+
+    private static ReadOnlyMemory<byte>? Bytes(byte[]? value) =>
+        value is null ? (ReadOnlyMemory<byte>?)null : new ReadOnlyMemory<byte>(value);
 
     private static SvnHttpResource ParseResource(string? value, string repositoryRoot, string specialSegment, string field) {
         if (string.IsNullOrWhiteSpace(value)) throw new BadHttpRequestException($"The {field} is missing.");

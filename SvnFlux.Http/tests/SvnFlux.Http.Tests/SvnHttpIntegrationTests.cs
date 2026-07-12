@@ -308,6 +308,71 @@ public sealed class SvnHttpIntegrationTests {
         } finally { DeleteDirectory(root); }
     }
 
+    [Fact]
+    public async Task AtomicRevisionPropertyMismatchReturnsPreconditionFailure() {
+        var repository = new SvnMemoryRepository();
+        await using var server = await TestServer.StartAsync(repository);
+        await repository.ChangeRevisionPropertyAsync(new(new(2), "review", "actual"u8.ToArray()));
+        using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+        using var request = new HttpRequestMessage(new HttpMethod("PROPPATCH"), server.Url + "/!svn/rev/2") {
+            Content = new StringContent("""<D:propertyupdate xmlns:D="DAV:" xmlns:V="http://subversion.tigris.org/xmlns/dav/" xmlns:C="http://subversion.tigris.org/xmlns/custom/"><D:set><D:prop><C:review><V:old-value>wrong</V:old-value>new</C:review></D:prop></D:set></D:propertyupdate>""", Encoding.UTF8, "text/xml")
+        };
+
+        using var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.MultiStatus, response.StatusCode);
+        Assert.Contains("412 Precondition Failed", await response.Content.ReadAsStringAsync());
+        var properties = await repository.GetRevisionPropertiesAsync(new(2));
+        Assert.Contains(properties.CustomProperties, property => property.Name == "review" && Encoding.UTF8.GetString(property.Value.Span) == "actual");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OfficialClientCanLockCommitUnlockAndChangeRevisionProperties(bool fileSystem) {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-locks-" + Guid.NewGuid().ToString("N"));
+        var workingCopy = Path.Combine(root, "working-copy");
+        Directory.CreateDirectory(root);
+        try {
+            ISvnWritableRepository repository = fileSystem
+                ? await SvnFileSystemRepository.CreateAsync(Path.Combine(root, "repository"))
+                : new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository);
+            await RunSvnAsync(server, "checkout", server.Url, workingCopy);
+            var path = Path.Combine(workingCopy, "readme.txt");
+
+            Assert.Contains("locked", await RunSvnAsync(server, "lock", "-m", "first lock", path), StringComparison.OrdinalIgnoreCase);
+            var remoteInfo = await RunSvnAsync(server, "info", server.Url + "/readme.txt");
+            Assert.Contains("Lock Token", remoteInfo);
+            Assert.NotNull(await repository.GetLockAsync(new("readme.txt")));
+            await File.WriteAllTextAsync(path, "locked commit");
+            Assert.Contains("Committed revision 3.", await RunSvnAsync(server, "commit", "--no-unlock", "-m", "keep lock", path));
+            Assert.NotNull(await repository.GetLockAsync(new("readme.txt")));
+            Assert.Contains("unlocked", await RunSvnAsync(server, "unlock", path), StringComparison.OrdinalIgnoreCase);
+            Assert.Null(await repository.GetLockAsync(new("readme.txt")));
+
+            await RunSvnAsync(server, "lock", "-m", "second lock", path);
+            await File.WriteAllTextAsync(path, "released lock");
+            Assert.Contains("Committed revision 4.", await RunSvnAsync(server, "commit", "-m", "release lock", path));
+            Assert.Null(await repository.GetLockAsync(new("readme.txt")));
+            var original = await repository.LockAsync(new(new("readme.txt"), "other", "original", false, new(4)));
+            await RunSvnAsync(server, "lock", "--force", "-m", "stolen", server.Url + "/readme.txt");
+            var stolen = await repository.GetLockAsync(new("readme.txt"));
+            Assert.NotNull(stolen);
+            Assert.NotEqual(original.Token, stolen.Token);
+            await RunSvnAsync(server, "unlock", "--force", server.Url + "/readme.txt");
+            Assert.Null(await repository.GetLockAsync(new("readme.txt")));
+
+            await RunSvnAsync(server, "propset", "review", "approved", "--revprop", "-r", "4", server.Url);
+            Assert.Equal("approved", await RunSvnAsync(server, "propget", "review", "--revprop", "-r", "4", server.Url));
+            var properties = await repository.GetRevisionPropertiesAsync(new(4));
+            Assert.Contains(properties.CustomProperties, property => property.Name == "review" && Encoding.UTF8.GetString(property.Value.Span) == "approved");
+            await RunSvnAsync(server, "propdel", "review", "--revprop", "-r", "4", server.Url);
+            var deleted = (await repository.GetRevisionPropertiesAsync(new(4))).CustomProperties.All(property => property.Name != "review");
+            Assert.True(deleted, string.Join('\n', server.Trace));
+        } finally { DeleteDirectory(root); }
+    }
+
     private static SvnRevisionProperties RevisionProperties(string message) =>
         new("tester", DateTimeOffset.UtcNow, message, SvnPropertyCollection.Empty);
 

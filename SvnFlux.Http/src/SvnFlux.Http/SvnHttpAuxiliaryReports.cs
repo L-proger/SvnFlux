@@ -10,16 +10,27 @@ namespace SvnFlux.Http;
 internal static class SvnHttpAuxiliaryReports {
     private const string ProtocolNamespace = "svn:";
 
-    internal static async Task WriteEmptyLocksAsync(HttpResponse response, CancellationToken token) {
+    internal static async Task WriteLocksAsync(HttpResponse response, ISvnWritableRepository repository, SvnRepositoryPath path, CancellationToken token) {
         response.StatusCode = StatusCodes.Status200OK;
         response.ContentType = "text/xml; charset=utf-8";
         await using var writer = XmlWriter.Create(response.Body, Settings());
         await writer.WriteStartDocumentAsync().ConfigureAwait(false);
         writer.WriteStartElement("S", "get-locks-report", ProtocolNamespace);
         writer.WriteAttributeString("xmlns", "D", null, SvnDavXml.Dav);
+        await foreach (var value in repository.GetLocksAsync(path, token).ConfigureAwait(false)) {
+            writer.WriteStartElement("S", "lock", ProtocolNamespace);
+            writer.WriteElementString("S", "path", ProtocolNamespace, "/" + value.Path.Value);
+            writer.WriteElementString("S", "token", ProtocolNamespace, value.Token);
+            writer.WriteElementString("S", "creationdate", ProtocolNamespace, value.Created.UtcDateTime.ToString("O", CultureInfo.InvariantCulture));
+            if (value.Expires is { } expires) writer.WriteElementString("S", "expirationdate", ProtocolNamespace, expires.UtcDateTime.ToString("O", CultureInfo.InvariantCulture));
+            writer.WriteElementString("S", "owner", ProtocolNamespace, value.Owner);
+            if (value.Comment is not null) writer.WriteElementString("S", "comment", ProtocolNamespace, value.Comment);
+            writer.WriteEndElement();
+        }
         writer.WriteEndElement();
         await writer.WriteEndDocumentAsync().ConfigureAwait(false);
         await writer.FlushAsync().ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
     }
 
     internal static async Task WriteLocationSegmentsAsync(HttpRequest request, HttpResponse response, ISvnRepository repository,

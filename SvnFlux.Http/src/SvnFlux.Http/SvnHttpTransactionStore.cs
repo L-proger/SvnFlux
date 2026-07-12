@@ -41,6 +41,7 @@ internal sealed class SvnHttpTransactionStore {
 internal sealed class SvnHttpTransaction : IAsyncDisposable {
     private readonly Dictionary<string, byte[]?> _revisionProperties = new(StringComparer.Ordinal);
     private readonly Dictionary<SvnRepositoryPath, StagedFile> _files = [];
+    private readonly ConcurrentDictionary<SvnRepositoryPath, string> _lockTokens = new();
     private readonly SemaphoreSlim _mutex = new(1, 1);
     private readonly string _directory;
     private readonly List<StructuralChange> _structuralChanges = [];
@@ -66,6 +67,10 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
     public DateTimeOffset LastAccess { get; private set; }
 
     public void Touch() => LastAccess = DateTimeOffset.UtcNow;
+
+    public void AddLockToken(SvnRepositoryPath path, string? header) {
+        if (SvnHttpLock.TryReadToken(header, out var token)) _lockTokens[path] = token;
+    }
 
     public async ValueTask<(bool Added, string Checksum)> PutFileAsync(SvnRepositoryPath path, HttpRequest request, CancellationToken token) {
         await _mutex.WaitAsync(token).ConfigureAwait(false);
@@ -172,7 +177,7 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
         } finally { _mutex.Release(); }
     }
 
-    public async ValueTask<(SvnRevision Revision, SvnRevisionProperties Properties)> CommitAsync(CancellationToken token) {
+    public async ValueTask<(SvnRevision Revision, SvnRevisionProperties Properties)> CommitAsync(bool keepLocks, CancellationToken token) {
         await _mutex.WaitAsync(token).ConfigureAwait(false);
         try {
             EnsureOpen();
@@ -208,7 +213,8 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
                 changes.Add(SvnCommitChange.ModifyProperties(pair.Key, kind, ToPropertyChanges(pair.Value)));
             }
             var properties = RevisionProperties();
-            var revision = await Repository.CommitAsync(new(BaseRevision, properties, changes), token).ConfigureAwait(false);
+            var request = new SvnCommitRequest(BaseRevision, properties, changes) { LockTokens = _lockTokens, KeepLocks = keepLocks };
+            var revision = await Repository.CommitAsync(request, token).ConfigureAwait(false);
             _closed = true;
             return (revision, properties);
         } finally { _mutex.Release(); }

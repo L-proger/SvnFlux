@@ -4,7 +4,7 @@ using Microsoft.AspNetCore.Http;
 
 namespace SvnFlux.Http;
 
-internal sealed record SvnHttpPropertyChange(string Name, byte[]? Value);
+internal sealed record SvnHttpPropertyChange(string Name, byte[]? Value, bool HasExpectedValue = false, byte[]? ExpectedValue = null);
 
 internal static class SvnHttpPropertyUpdate {
     internal static async ValueTask<IReadOnlyList<SvnHttpPropertyChange>> ReadAsync(HttpRequest request, long maximumSize, CancellationToken token) {
@@ -38,22 +38,55 @@ internal static class SvnHttpPropertyUpdate {
             }
             if (!inProperties || set is null || reader.NodeType != XmlNodeType.Element) continue;
             var name = PropertyName(reader.NamespaceURI, reader.LocalName);
-            var encoded = reader.GetAttribute("encoding", SvnDavXml.SvnDav);
-            if (!set.Value) {
-                changes.Add(new(name, null));
-                if (!reader.IsEmptyElement) await reader.SkipAsync().ConfigureAwait(false);
-                continue;
-            }
-            var text = await reader.ReadElementContentAsStringAsync().ConfigureAwait(false);
-            byte[] value;
-            try { value = encoded == "base64" ? Convert.FromBase64String(text) : Encoding.UTF8.GetBytes(text); }
-            catch (FormatException) { throw new BadHttpRequestException($"Property '{name}' has invalid base64 content."); }
-            changes.Add(new(name, value));
+            changes.Add(await ReadChangeAsync(reader, set.Value, name).ConfigureAwait(false));
         }
         return changes;
     }
 
-    internal static async Task WriteResponseAsync(HttpResponse response, string href, CancellationToken token) {
+    private static async ValueTask<SvnHttpPropertyChange> ReadChangeAsync(XmlReader reader, bool set, string name) {
+        if (!set) {
+            if (!reader.IsEmptyElement) await reader.SkipAsync().ConfigureAwait(false);
+            return new(name, null);
+        }
+        var encoding = reader.GetAttribute("encoding", SvnDavXml.SvnDav);
+        var absent = reader.GetAttribute("absent", SvnDavXml.SvnDav) == "1";
+        if (reader.IsEmptyElement) return new(name, absent ? null : [], false);
+        var depth = reader.Depth;
+        var text = new StringBuilder();
+        byte[]? expected = null;
+        var hasExpected = false;
+        while (await reader.ReadAsync().ConfigureAwait(false)) {
+            if (reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth) break;
+            if (reader.NodeType == XmlNodeType.Element && reader.Depth == depth + 1 &&
+                reader.NamespaceURI == SvnDavXml.SvnDav && reader.LocalName == "old-value") {
+                hasExpected = true;
+                expected = await ReadValueAsync(reader, name).ConfigureAwait(false);
+                continue;
+            }
+            if (reader.Depth == depth + 1 && reader.NodeType is XmlNodeType.Text or XmlNodeType.CDATA) text.Append(reader.Value);
+        }
+        return new(name, absent ? null : Decode(text.ToString(), encoding, name), hasExpected, expected);
+    }
+
+    private static async ValueTask<byte[]?> ReadValueAsync(XmlReader reader, string name) {
+        var encoding = reader.GetAttribute("encoding", SvnDavXml.SvnDav);
+        var absent = reader.GetAttribute("absent", SvnDavXml.SvnDav) == "1";
+        if (reader.IsEmptyElement) return absent ? null : [];
+        var depth = reader.Depth;
+        var text = new StringBuilder();
+        while (await reader.ReadAsync().ConfigureAwait(false)) {
+            if (reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth) break;
+            if (reader.NodeType is XmlNodeType.Text or XmlNodeType.CDATA) text.Append(reader.Value);
+        }
+        return absent ? null : Decode(text.ToString(), encoding, name);
+    }
+
+    private static byte[] Decode(string value, string? encoding, string name) {
+        try { return encoding == "base64" ? Convert.FromBase64String(value) : Encoding.UTF8.GetBytes(value); }
+        catch (FormatException) { throw new BadHttpRequestException($"Property '{name}' has invalid base64 content."); }
+    }
+
+    internal static async Task WriteResponseAsync(HttpResponse response, string href, CancellationToken token, int propertyStatus = StatusCodes.Status200OK) {
         response.StatusCode = StatusCodes.Status207MultiStatus;
         response.ContentType = "text/xml; charset=utf-8";
         var settings = new XmlWriterSettings { Async = true, Encoding = new UTF8Encoding(false), CloseOutput = false };
@@ -65,7 +98,7 @@ internal static class SvnHttpPropertyUpdate {
         writer.WriteStartElement("D", "propstat", SvnDavXml.Dav);
         writer.WriteStartElement("D", "prop", SvnDavXml.Dav);
         writer.WriteEndElement();
-        writer.WriteElementString("D", "status", SvnDavXml.Dav, "HTTP/1.1 200 OK");
+        writer.WriteElementString("D", "status", SvnDavXml.Dav, $"HTTP/1.1 {propertyStatus} {Microsoft.AspNetCore.WebUtilities.ReasonPhrases.GetReasonPhrase(propertyStatus)}");
         writer.WriteEndElement();
         writer.WriteEndElement();
         writer.WriteEndElement();

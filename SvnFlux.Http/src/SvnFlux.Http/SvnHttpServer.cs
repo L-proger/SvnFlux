@@ -7,7 +7,7 @@ using SvnFlux.Svndiff;
 namespace SvnFlux.Http;
 
 internal static class SvnHttpServer {
-    internal static readonly string[] Methods = ["OPTIONS", "PROPFIND", "REPORT", "GET", "HEAD", "POST", "PROPPATCH", "PUT", "MERGE", "DELETE", "MKCOL", "COPY"];
+    internal static readonly string[] Methods = ["OPTIONS", "PROPFIND", "REPORT", "GET", "HEAD", "POST", "PROPPATCH", "PUT", "MERGE", "DELETE", "MKCOL", "COPY", "LOCK", "UNLOCK"];
 
     internal static async Task HandleAsync(HttpContext context, ISvnRepository repository, string? path) {
         string? detail = null;
@@ -28,6 +28,8 @@ internal static class SvnHttpServer {
                 case "DELETE": await SvnHttpCommit.DeleteAsync(context, repository, resource, transactions).ConfigureAwait(false); break;
                 case "MKCOL": await SvnHttpCommit.MakeCollectionAsync(context, repository, resource, transactions).ConfigureAwait(false); break;
                 case "COPY": await SvnHttpCommit.CopyAsync(context, repository, resource, options, transactions, RepositoryRoot(context)).ConfigureAwait(false); break;
+                case "LOCK": await SvnHttpLock.LockAsync(context, repository, resource, options).ConfigureAwait(false); break;
+                case "UNLOCK": await SvnHttpLock.UnlockAsync(context, repository, resource).ConfigureAwait(false); break;
                 default: context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; break;
             }
         } catch (BadHttpRequestException exception) { detail = exception.Message; context.Response.StatusCode = exception.StatusCode; }
@@ -36,6 +38,10 @@ internal static class SvnHttpServer {
         catch (SvnOutOfDateException exception) {
             detail = exception.Message;
             await SvnDavXml.WriteErrorAsync(context.Response, StatusCodes.Status409Conflict, 160028, exception.Message, context.RequestAborted).ConfigureAwait(false);
+        }
+        catch (SvnLockException exception) {
+            detail = exception.Message;
+            await SvnDavXml.WriteErrorAsync(context.Response, StatusCodes.Status423Locked, 160035, exception.Message, context.RequestAborted).ConfigureAwait(false);
         }
         catch (SvnHttpTransactionNotFoundException) { context.Response.StatusCode = StatusCodes.Status404NotFound; }
         catch (Exception exception) { detail = exception.ToString(); context.Response.StatusCode = StatusCodes.Status500InternalServerError; throw; }
@@ -54,6 +60,8 @@ internal static class SvnHttpServer {
         context.Response.Headers.Append("MS-Author-Via", "DAV");
         context.Response.Headers.Append("SVN-Youngest-Rev", revision.Value.ToString());
         context.Response.Headers.Append("SVN-Repository-UUID", repository.Id.ToString());
+        context.Response.Headers.Append("DAV", SvnDavXml.SvnDav + "svn/log-revprops");
+        context.Response.Headers.Append("DAV", SvnDavXml.SvnDav + "svn/atomic-revprops");
         context.Response.Headers.Append("SVN-Repository-Root", root);
         context.Response.Headers.Append("SVN-Me-Resource", special + "/me");
         context.Response.Headers.Append("SVN-Rev-Stub", special + "/rev");
@@ -71,13 +79,24 @@ internal static class SvnHttpServer {
         if (resource.Kind == SvnHttpResourceKind.Revision) {
             var revision = resource.Revision!.Value;
             var properties = await repository.GetRevisionPropertiesAsync(revision, context.RequestAborted).ConfigureAwait(false);
-            await SvnDavXml.WriteRevisionAsync(context.Response, context.Request.Path, revision, properties, requested, context.RequestAborted).ConfigureAwait(false); return;
+            context.Items["SvnFlux.Http.Trace"] = "requested=" + string.Join(", ", requested.Select(property => property.Namespace + property.Name)) +
+                "; revision-properties=" + string.Join(", ", properties.CustomProperties.Select(property => property.Name));
+            var revisionResponseProperties = requested.ToList();
+            if (requested.Any(property => property.Namespace == SvnDavXml.SvnDav && property.Name == "deadprop-count"))
+                foreach (var property in properties.CustomProperties.Select(value => value.Name.StartsWith("svn:", StringComparison.Ordinal)
+                    ? new System.Xml.XmlQualifiedName(value.Name[4..], SvnDavXml.Svn)
+                    : new System.Xml.XmlQualifiedName(value.Name, SvnDavXml.Custom)))
+                    if (!revisionResponseProperties.Contains(property)) revisionResponseProperties.Add(property);
+            await SvnDavXml.WriteRevisionAsync(context.Response, context.Request.Path, revision, properties, revisionResponseProperties, context.RequestAborted).ConfigureAwait(false);
+            return;
         }
         if (resource.Kind is not (SvnHttpResourceKind.Public or SvnHttpResourceKind.RevisionRoot)) { context.Response.StatusCode = 405; return; }
         var revisionNumber = resource.Revision ?? await repository.GetLatestRevisionAsync(context.RequestAborted).ConfigureAwait(false);
         var root = await repository.OpenRevisionAsync(revisionNumber, context.RequestAborted).ConfigureAwait(false);
         var node = await ReadNodeAsync(root, resource.Path, context.Request.Path, context.RequestAborted).ConfigureAwait(false);
         if (node is null) { context.Response.StatusCode = 404; return; }
+        var locks = resource.Kind == SvnHttpResourceKind.Public ? repository as ISvnWritableRepository : null;
+        if (locks is not null) node = node with { Lock = await locks.GetLockAsync(resource.Path, context.RequestAborted).ConfigureAwait(false) };
         context.Items["SvnFlux.Http.Trace"] = "requested=" + string.Join(", ", requested.Select(property => property.Namespace + property.Name)) +
             "; node-properties=" + string.Join(", ", node.Properties.Select(property => property.Name));
         var nodes = new List<SvnDavNode> { node };
@@ -88,7 +107,8 @@ internal static class SvnHttpServer {
                 var childPath = resource.Path.IsRoot ? new SvnRepositoryPath(entry.Name) : new SvnRepositoryPath(resource.Path.Value + "/" + entry.Name);
                 var href = context.Request.Path.ToString().TrimEnd('/') + "/" + Uri.EscapeDataString(entry.Name) + (entry.NodeInfo.Kind == SvnNodeKind.Directory ? "/" : "");
                 var properties = await root.GetPropertiesAsync(childPath, context.RequestAborted).ConfigureAwait(false);
-                nodes.Add(new(href, childPath, entry.NodeInfo, properties));
+                var childLock = locks is null ? null : await locks.GetLockAsync(childPath, context.RequestAborted).ConfigureAwait(false);
+                nodes.Add(new(href, childPath, entry.NodeInfo, properties, childLock));
             }
         }
         var stub = RepositoryRoot(context) + "/" + options.SpecialResourceSegment + "/rvr";
@@ -136,7 +156,8 @@ internal static class SvnHttpServer {
             return;
         }
         if (reportName == "get-locks-report") {
-            await SvnHttpAuxiliaryReports.WriteEmptyLocksAsync(context.Response, context.RequestAborted).ConfigureAwait(false);
+            if (repository is not ISvnWritableRepository writable) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
+            await SvnHttpAuxiliaryReports.WriteLocksAsync(context.Response, writable, resource.Path, context.RequestAborted).ConfigureAwait(false);
             return;
         }
         if (reportName == "get-locations") {

@@ -31,7 +31,7 @@ internal static class SvnDavXml {
     private static readonly XmlQualifiedName[] DefaultProperties = [
         new("resourcetype", Dav), new("getcontentlength", Dav), new("getcontenttype", Dav), new("getlastmodified", Dav),
         new("creationdate", Dav), new("getetag", Dav), new("version-name", Dav), new("creator-displayname", Dav),
-        new("checked-in", Dav), new("baseline-relative-path", SvnDav), new("repository-uuid", SvnDav), new("deadprop-count", SvnDav)
+        new("checked-in", Dav), new("lockdiscovery", Dav), new("baseline-relative-path", SvnDav), new("repository-uuid", SvnDav), new("deadprop-count", SvnDav)
     ];
 
     internal static async ValueTask<IReadOnlyList<XmlQualifiedName>> ReadPropertyRequestAsync(HttpRequest request, long maximumSize, CancellationToken token) {
@@ -107,6 +107,8 @@ internal static class SvnDavXml {
                 Svn when property.Name == "author" => properties.Author,
                 Svn when property.Name == "date" => properties.Date?.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
                 Svn when property.Name == "log" => properties.LogMessage,
+                Svn => Property(properties.CustomProperties, "svn:" + property.Name),
+                Custom => Property(properties.CustomProperties, property.Name),
                 _ => null
             };
             if (value is not null) Element(writer, Prefix(property.Namespace), property.Name, property.Namespace, value);
@@ -127,6 +129,10 @@ internal static class SvnDavXml {
             writer.WriteStartElement(prefix, property.Name, property.Namespace);
             Element(writer, "D", "href", Dav, RevisionHref(revisionRootStub, node.Info.LastChangedRevision, node.Path));
             writer.WriteEndElement(); return;
+        }
+        if (property.Namespace == Dav && property.Name == "lockdiscovery") {
+            SvnHttpLock.WriteDiscovery(writer, node.Lock);
+            return;
         }
         var value = property.Namespace switch {
             Dav when property.Name == "getcontentlength" => node.Info.Kind == SvnNodeKind.File ? node.Info.Size.ToString(CultureInfo.InvariantCulture) : "0",
@@ -156,4 +162,4 @@ internal static class SvnDavXml {
     private static void Element(XmlWriter writer, string prefix, string name, string ns, string? value) => writer.WriteElementString(prefix, name, ns, value ?? "");
 }
 
-internal sealed record SvnDavNode(string Href, SvnRepositoryPath Path, SvnNodeInfo Info, SvnPropertyCollection Properties);
+internal sealed record SvnDavNode(string Href, SvnRepositoryPath Path, SvnNodeInfo Info, SvnPropertyCollection Properties, SvnLock? Lock = null);
