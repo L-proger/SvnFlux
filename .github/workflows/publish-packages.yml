@@ -79,7 +79,9 @@ jobs:
             'SvnFlux.Core/src/SvnFlux.Core/SvnFlux.Core.csproj',
             'SvnFlux.Svndiff/src/SvnFlux.Svndiff/SvnFlux.Svndiff.csproj',
             'SvnFlux.RaSvn/src/SvnFlux.RaSvn/SvnFlux.RaSvn.csproj',
-            'SvnFlux.Repository.FileSystem/src/SvnFlux.Repository.FileSystem/SvnFlux.Repository.FileSystem.csproj'
+            'SvnFlux.Repository.FileSystem/src/SvnFlux.Repository.FileSystem/SvnFlux.Repository.FileSystem.csproj',
+            'SvnFlux.Repository.Memory/src/SvnFlux.Repository.Memory/SvnFlux.Repository.Memory.csproj',
+            'SvnFlux.Http/src/SvnFlux.Http/SvnFlux.Http.csproj'
           )
           foreach ($project in $projects) {
             dotnet pack $project -c Release --no-restore --no-build `

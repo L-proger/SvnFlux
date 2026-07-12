@@ -8,6 +8,8 @@ Packages:
 - SvnFlux.Svndiff - streaming svndiff 0/1 encoder and decoder;
 - SvnFlux.RaSvn - native svn protocol implementation;
 - SvnFlux.Repository.FileSystem - directly browsable mutable filesystem repository backend.
+- SvnFlux.Repository.Memory - ephemeral in-memory repository backend for tests and embedded servers.
+- SvnFlux.Http - embeddable modern Subversion HTTPv2 endpoints for ASP.NET Core.
 
 The production libraries are implemented in managed C# and do not depend on native Subversion libraries. The official svn command-line client is used only by integration tests.
 
