@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Xml;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using SvnFlux.Core;
 
 namespace SvnFlux.Http;
@@ -9,6 +10,8 @@ internal static class SvnHttpLock {
     internal static async Task LockAsync(HttpContext context, ISvnRepository repository, SvnHttpResource resource, SvnHttpOptions options) {
         if (resource.Kind != SvnHttpResourceKind.Public || repository is not ISvnWritableRepository writable) { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
         var expires = ReadExpiration(context.Request.Headers["Timeout"]);
+        var hooks = context.RequestServices.GetServices<ISvnHttpHook>().ToArray();
+        SvnLockRequest? hookRequest = null;
         SvnLock value;
         if ((context.Request.ContentLength ?? 0) == 0 && TryReadToken(context.Request.Headers["If"], out var refreshToken)) {
             value = await writable.RefreshLockAsync(resource.Path, refreshToken, expires, context.RequestAborted).ConfigureAwait(false);
@@ -17,8 +20,11 @@ internal static class SvnHttpLock {
             var currentRevision = SvnHttpTransaction.ReadBaseRevision(context.Request.Headers["X-SVN-Version-Name"]);
             var steal = context.Request.Headers["X-SVN-Options"].Any(option => option?.Contains("lock-steal", StringComparison.OrdinalIgnoreCase) == true);
             var owner = context.User.Identity?.Name ?? "anonymous";
-            value = await writable.LockAsync(new(resource.Path, owner, comment, steal, currentRevision, expires), context.RequestAborted).ConfigureAwait(false);
+            hookRequest = new(resource.Path, owner, comment, steal, currentRevision, expires);
+            await SvnHttpHookPipeline.BeforeLockAsync(hooks, new(writable, hookRequest), context.RequestAborted).ConfigureAwait(false);
+            value = await writable.LockAsync(hookRequest, context.RequestAborted).ConfigureAwait(false);
         }
+        if (hookRequest is not null) await SvnHttpHookPipeline.AfterLockAsync(hooks, new(writable, hookRequest, value), options.HookError).ConfigureAwait(false);
         context.Response.Headers["Lock-Token"] = "<" + value.Token + ">";
         context.Response.Headers["Timeout"] = Timeout(value);
         context.Response.Headers["X-SVN-Lock-Owner"] = value.Owner;

@@ -15,6 +15,7 @@ internal static class SvnHttpErrors {
             SvnHttpProtocolException value => (value.StatusCode, value.ErrorCode),
             BadHttpRequestException value => (value.StatusCode, 175002),
             SvnPathNotFoundException => (StatusCodes.Status404NotFound, 160013),
+            SvnHttpHookRejectedException => (StatusCodes.Status403Forbidden, 165001),
             SvnInvalidRevisionException => (StatusCodes.Status404NotFound, 160006),
             SvnNodeKindMismatchException => (StatusCodes.Status409Conflict, 160017),
             SvnOutOfDateException => (StatusCodes.Status409Conflict, 160028),

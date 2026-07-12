@@ -7,6 +7,7 @@ public sealed class SvnHttpOptions {
     public int MaximumActiveTransactions { get; set; } = 128;
     public TimeSpan TransactionIdleTimeout { get; set; } = TimeSpan.FromMinutes(30);
     public Action<SvnHttpTrace>? Trace { get; set; }
+    public Action<Exception>? HookError { get; set; }
 }
 
 public readonly record struct SvnHttpTrace(string Method, string Path, int StatusCode, string? Detail = null);

@@ -218,7 +218,7 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
         } finally { _mutex.Release(); }
     }
 
-    public async ValueTask<(SvnRevision Revision, SvnRevisionProperties Properties)> CommitAsync(bool keepLocks, CancellationToken token) {
+    public async ValueTask<(SvnRevision Revision, SvnRevisionProperties Properties, SvnCommitRequest Request)> CommitAsync(bool keepLocks, IReadOnlyList<ISvnHttpHook> hooks, CancellationToken token) {
         await _mutex.WaitAsync(token).ConfigureAwait(false);
         try {
             EnsureOpen();
@@ -256,9 +256,10 @@ internal sealed class SvnHttpTransaction : IAsyncDisposable {
             }
             var properties = RevisionProperties();
             var request = new SvnCommitRequest(BaseRevision, properties, changes) { LockTokens = _lockTokens, KeepLocks = keepLocks };
+            await SvnHttpHookPipeline.BeforeCommitAsync(hooks, new(Repository, Id, request), token).ConfigureAwait(false);
             var revision = await Repository.CommitAsync(request, token).ConfigureAwait(false);
             _state = TransactionState.Committed;
-            return (revision, properties);
+            return (revision, properties, request);
         } catch { if (_state == TransactionState.Committing) _state = TransactionState.Open; throw; } finally { _mutex.Release(); }
     }
 

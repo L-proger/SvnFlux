@@ -60,13 +60,16 @@ internal static class SvnHttpServer {
         context.Response.Headers.Append("SVN-Repository-UUID", repository.Id.ToString());
         context.Response.Headers.Append("DAV", SvnDavXml.SvnDav + "svn/log-revprops");
         context.Response.Headers.Append("DAV", SvnDavXml.SvnDav + "svn/atomic-revprops");
+        context.Response.Headers.Append("DAV", SvnDavXml.SvnDav + "svn/partial-replay");
+        context.Response.Headers.Append("DAV", SvnDavXml.SvnDav + "svn/replay-rev-resource");
+        context.Response.Headers.Append("DAV", SvnDavXml.SvnDav + "svn/inherited-props");
         context.Response.Headers.Append("SVN-Repository-Root", root);
         context.Response.Headers.Append("SVN-Me-Resource", special + "/me");
         context.Response.Headers.Append("SVN-Rev-Stub", special + "/rev");
         context.Response.Headers.Append("SVN-Rev-Root-Stub", special + "/rvr");
         context.Response.Headers.Append("SVN-Txn-Stub", special + "/txn");
         context.Response.Headers.Append("SVN-Txn-Root-Stub", special + "/txr");
-        context.Response.Headers.Append("SVN-Repository-MergeInfo", "no");
+        context.Response.Headers.Append("SVN-Repository-MergeInfo", "yes");
         context.Response.Headers.Append("SVN-Allow-Bulk-Updates", "Prefer");
         context.Response.StatusCode = StatusCodes.Status200OK;
         await SvnDavXml.WriteOptionsAsync(context.Response, special + "/act", context.RequestAborted).ConfigureAwait(false);
@@ -80,11 +83,18 @@ internal static class SvnHttpServer {
             context.Items["SvnFlux.Http.Trace"] = "requested=" + string.Join(", ", requested.Select(property => property.Namespace + property.Name)) +
                 "; revision-properties=" + string.Join(", ", properties.CustomProperties.Select(property => property.Name));
             var revisionResponseProperties = requested.ToList();
-            if (requested.Any(property => property.Namespace == SvnDavXml.SvnDav && property.Name == "deadprop-count"))
+            if (requested.Any(property => property.Namespace == SvnDavXml.SvnDav && property.Name == "deadprop-count")) {
+                var standard = new[] {
+                    properties.Author is null ? null : new System.Xml.XmlQualifiedName("author", SvnDavXml.Svn),
+                    properties.Date is null ? null : new System.Xml.XmlQualifiedName("date", SvnDavXml.Svn),
+                    properties.LogMessage is null ? null : new System.Xml.XmlQualifiedName("log", SvnDavXml.Svn)
+                };
+                foreach (var property in standard) if (property is not null && !revisionResponseProperties.Contains(property)) revisionResponseProperties.Add(property);
                 foreach (var property in properties.CustomProperties.Select(value => value.Name.StartsWith("svn:", StringComparison.Ordinal)
                     ? new System.Xml.XmlQualifiedName(value.Name[4..], SvnDavXml.Svn)
                     : new System.Xml.XmlQualifiedName(value.Name, SvnDavXml.Custom)))
                     if (!revisionResponseProperties.Contains(property)) revisionResponseProperties.Add(property);
+            }
             await SvnDavXml.WriteRevisionAsync(context.Response, context.Request.Path, revision, properties, revisionResponseProperties, context.RequestAborted).ConfigureAwait(false);
             return;
         }
@@ -168,6 +178,23 @@ internal static class SvnHttpServer {
                 ? SvnDiffVersion.One : SvnDiffVersion.Zero;
             await SvnHttpAuxiliaryReports.WriteFileRevisionsAsync(context.Request, context.Response, repository, resource.Path,
                 version, options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false);
+            return;
+        }
+        if (reportName == "mergeinfo-report") {
+            await SvnHttpMergeInfoReport.WriteAsync(context.Request, context.Response, repository, resource.Path, latest,
+                options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false);
+            return;
+        }
+        if (reportName == "replay-report") {
+            var version = context.Request.Headers["DAV"].Any(value => value?.Contains("svn/svndiff1", StringComparison.OrdinalIgnoreCase) == true)
+                ? SvnDiffVersion.One : SvnDiffVersion.Zero;
+            await SvnHttpReplayReport.WriteAsync(context.Request, context.Response, repository, resource, version,
+                options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false);
+            return;
+        }
+        if (reportName == "inherited-props-report") {
+            await SvnHttpInheritedPropertiesReport.WriteAsync(context.Request, context.Response, repository, resource.Path, latest,
+                options.MaximumXmlRequestSize, context.RequestAborted).ConfigureAwait(false);
             return;
         }
         context.Response.StatusCode = StatusCodes.Status501NotImplemented;

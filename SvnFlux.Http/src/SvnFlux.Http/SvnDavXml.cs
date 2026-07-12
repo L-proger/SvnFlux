@@ -100,23 +100,48 @@ internal static class SvnDavXml {
         await writer.WriteStartDocumentAsync().ConfigureAwait(false);
         writer.WriteStartElement("D", "multistatus", Dav);
         writer.WriteStartElement("D", "response", Dav); Element(writer, "D", "href", Dav, href);
-        writer.WriteStartElement("D", "propstat", Dav); writer.WriteStartElement("D", "prop", Dav);
-        foreach (var property in requested) {
-            string? value = property.Namespace switch {
-                Dav when property.Name == "version-name" => revision.Value.ToString(CultureInfo.InvariantCulture),
-                Svn when property.Name == "author" => properties.Author,
-                Svn when property.Name == "date" => properties.Date?.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
-                Svn when property.Name == "log" => properties.LogMessage,
-                Svn => Property(properties.CustomProperties, "svn:" + property.Name),
-                Custom => Property(properties.CustomProperties, property.Name),
-                _ => null
-            };
-            if (value is not null) Element(writer, Prefix(property.Namespace), property.Name, property.Namespace, value);
-            else { writer.WriteStartElement(Prefix(property.Namespace), property.Name, property.Namespace); writer.WriteEndElement(); }
+        var found = requested.Where(property => HasRevisionProperty(property, properties)).ToArray();
+        var missing = requested.Where(property => !HasRevisionProperty(property, properties)).ToArray();
+        if (found.Length != 0) {
+            writer.WriteStartElement("D", "propstat", Dav); writer.WriteStartElement("D", "prop", Dav);
+            foreach (var property in found) {
+                var value = property.Namespace switch {
+                    Dav => revision.Value.ToString(CultureInfo.InvariantCulture),
+                    Svn when property.Name == "author" => properties.Author,
+                    Svn when property.Name == "date" => properties.Date?.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
+                    Svn when property.Name == "log" => properties.LogMessage,
+                    Svn => Property(properties.CustomProperties, "svn:" + property.Name),
+                    Custom => Property(properties.CustomProperties, property.Name),
+                    SvnDav => RevisionPropertyCount(properties).ToString(CultureInfo.InvariantCulture),
+                    _ => null
+                };
+                Element(writer, Prefix(property.Namespace), property.Name, property.Namespace, value);
+            }
+            writer.WriteEndElement(); Element(writer, "D", "status", Dav, "HTTP/1.1 200 OK"); writer.WriteEndElement();
         }
-        writer.WriteEndElement(); Element(writer, "D", "status", Dav, "HTTP/1.1 200 OK"); writer.WriteEndElement(); writer.WriteEndElement(); writer.WriteEndElement();
+        if (missing.Length != 0) {
+            writer.WriteStartElement("D", "propstat", Dav); writer.WriteStartElement("D", "prop", Dav);
+            foreach (var property in missing) { writer.WriteStartElement(Prefix(property.Namespace), property.Name, property.Namespace); writer.WriteEndElement(); }
+            writer.WriteEndElement(); Element(writer, "D", "status", Dav, "HTTP/1.1 404 Not Found"); writer.WriteEndElement();
+        }
+        writer.WriteEndElement(); writer.WriteEndElement();
         await writer.WriteEndDocumentAsync().ConfigureAwait(false); await writer.FlushAsync().ConfigureAwait(false); token.ThrowIfCancellationRequested();
     }
+
+
+    private static bool HasRevisionProperty(XmlQualifiedName property, SvnRevisionProperties properties) => property.Namespace switch {
+        Dav => property.Name == "version-name",
+        Svn when property.Name == "author" => properties.Author is not null,
+        Svn when property.Name == "date" => properties.Date is not null,
+        Svn when property.Name == "log" => properties.LogMessage is not null,
+        Svn => properties.CustomProperties.Any(value => value.Name == "svn:" + property.Name),
+        Custom => properties.CustomProperties.Any(value => value.Name == property.Name),
+        SvnDav => property.Name == "deadprop-count",
+        _ => false
+    };
+
+    private static int RevisionPropertyCount(SvnRevisionProperties properties) => properties.CustomProperties.Count +
+        (properties.Author is null ? 0 : 1) + (properties.Date is null ? 0 : 1) + (properties.LogMessage is null ? 0 : 1);
 
     private static void WriteNodeProperty(XmlWriter writer, XmlQualifiedName property, SvnDavNode node, Guid repositoryId, string revisionRootStub) {
         var prefix = Prefix(property.Namespace);

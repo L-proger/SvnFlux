@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using System.Xml;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using SvnFlux.Core;
 
 namespace SvnFlux.Http;
@@ -78,10 +79,15 @@ internal static class SvnHttpCommit {
         var transaction = store.Get(repository, merge.TransactionId);
         transaction.AddLockTokens(merge.LockTokens);
         var keepLocks = !context.Request.Headers["X-SVN-Options"].Any(value => value?.Contains("release-locks", StringComparison.OrdinalIgnoreCase) == true);
-        var result = await transaction.CommitAsync(keepLocks, context.RequestAborted).ConfigureAwait(false);
+        var hooks = context.RequestServices.GetServices<ISvnHttpHook>().ToArray();
+        var result = await transaction.CommitAsync(keepLocks, hooks, context.RequestAborted).ConfigureAwait(false);
         try {
             await WriteMergeResponseAsync(context.Response, repositoryRoot, result.Revision, result.Properties, context.RequestAborted).ConfigureAwait(false);
-        } finally { await store.RemoveAsync(transaction).ConfigureAwait(false); }
+        } finally {
+            try {
+                await SvnHttpHookPipeline.AfterCommitAsync(hooks, new(transaction.Repository, transaction.Id, result.Request, result.Revision), options.HookError).ConfigureAwait(false);
+            } finally { await store.RemoveAsync(transaction).ConfigureAwait(false); }
+        }
     }
 
     internal static async Task DeleteAsync(HttpContext context, ISvnRepository repository, SvnHttpResource resource, SvnHttpOptions options, SvnHttpTransactionStore store, string repositoryRoot) {

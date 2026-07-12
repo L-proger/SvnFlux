@@ -505,6 +505,280 @@ public sealed class SvnHttpIntegrationTests {
         Assert.Equal(new SvnRevision(2), await repository.GetLatestRevisionAsync());
     }
 
+    [Fact]
+    public async Task MergeInfoReportHandlesExplicitDescendantAndNearestAncestorQueries() {
+        var repository = new SvnMemoryRepository();
+        await using var server = await TestServer.StartAsync(repository);
+        await repository.CommitAsync(new(new(2), RevisionProperties("mergeinfo"), [
+            SvnCommitChange.ModifyProperties(new("src"), SvnNodeKind.Directory, [SvnPropertyChange.Set("svn:mergeinfo", "/trunk:1-2"u8)]),
+            SvnCommitChange.ModifyProperties(new("src/code.cs"), SvnNodeKind.File, [SvnPropertyChange.Set("svn:mergeinfo", "/trunk/code.cs:2"u8)])
+        ]));
+        using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+        const string start = """<S:mergeinfo-report xmlns:S="svn:"><S:revision>3</S:revision>""";
+        using var explicitRequest = new HttpRequestMessage(HttpMethod.Parse("REPORT"), server.Url + "/!svn/rvr/3/src") {
+            Content = new StringContent(start + "<S:inherit>explicit</S:inherit><S:include-descendants>yes</S:include-descendants><S:path></S:path></S:mergeinfo-report>", Encoding.UTF8, "text/xml")
+        };
+
+        using var explicitResponse = await client.SendAsync(explicitRequest);
+        var explicitXml = await explicitResponse.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, explicitResponse.StatusCode);
+        Assert.Contains("/trunk:1-2", explicitXml);
+        Assert.Contains("code.cs", explicitXml);
+        Assert.Contains("/trunk/code.cs:2", explicitXml);
+
+        using var inheritedRequest = new HttpRequestMessage(HttpMethod.Parse("REPORT"), server.Url + "/!svn/rvr/3/src/code.cs") {
+            Content = new StringContent(start + "<S:inherit>nearest-ancestor</S:inherit><S:path></S:path></S:mergeinfo-report>", Encoding.UTF8, "text/xml")
+        };
+        using var inheritedResponse = await client.SendAsync(inheritedRequest);
+        var inheritedXml = await inheritedResponse.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, inheritedResponse.StatusCode);
+        Assert.Contains("/trunk:1-2", inheritedXml);
+        Assert.DoesNotContain("/trunk/code.cs:2", inheritedXml);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OfficialClientTracksAndSkipsRepeatedMerges(bool fileSystem) {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-merge-" + Guid.NewGuid().ToString("N"));
+        var trunk = Path.Combine(root, "trunk");
+        var branch = Path.Combine(root, "branch");
+        Directory.CreateDirectory(root);
+        try {
+            ISvnWritableRepository repository = fileSystem ? await SvnFileSystemRepository.CreateAsync(Path.Combine(root, "repository")) : new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository);
+            Assert.Contains("Committed revision 3.", await RunSvnAsync(server, "mkdir", server.Url + "/branches", "-m", "branches"));
+            Assert.Contains("Committed revision 4.", await RunSvnAsync(server, "copy", server.Url + "/src", server.Url + "/branches/feature", "-m", "feature branch"));
+            await RunSvnAsync(server, "checkout", server.Url + "/src", trunk);
+            await File.WriteAllTextAsync(Path.Combine(trunk, "code.cs"), "class C { int Added; }");
+            Assert.Contains("Committed revision 5.", await RunSvnAsync(server, "commit", "-m", "trunk change", trunk));
+            await RunSvnAsync(server, "checkout", server.Url + "/branches/feature", branch);
+
+            var merge = await RunSvnAsync(server, "merge", server.Url + "/src", branch);
+
+            Assert.Contains("Merging", merge);
+            Assert.Equal("class C { int Added; }", await File.ReadAllTextAsync(Path.Combine(branch, "code.cs")));
+            var mergeInfo = await RunSvnAsync(server, "propget", "svn:mergeinfo", branch);
+            Assert.Contains("/src:", mergeInfo);
+            Assert.Contains("5", mergeInfo);
+            var pendingStatus = await RunSvnAsync(server, "status", branch);
+            await RunSvnAsync(server, "merge", server.Url + "/src", branch);
+            Assert.Equal(mergeInfo, await RunSvnAsync(server, "propget", "svn:mergeinfo", branch));
+            Assert.Equal(pendingStatus, await RunSvnAsync(server, "status", branch));
+            Assert.Contains("Committed revision 6.", await RunSvnAsync(server, "commit", "-m", "merge trunk", branch));
+            Assert.Equal("", await RunSvnAsync(server, "status", branch));
+            Assert.Contains("r5", await RunSvnAsync(server, "mergeinfo", "--show-revs=merged", server.Url + "/src", branch));
+        } finally { DeleteDirectory(root); }
+    }
+
+    [Fact]
+    public async Task OfficialClientReportsTextPropertyAndTreeMergeConflicts() {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-merge-conflicts-" + Guid.NewGuid().ToString("N"));
+        var trunk = Path.Combine(root, "trunk");
+        var branch = Path.Combine(root, "branch");
+        Directory.CreateDirectory(root);
+        try {
+            var repository = new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository);
+            await RunSvnAsync(server, "checkout", server.Url + "/src", trunk);
+            var trunkCode = Path.Combine(trunk, "code.cs");
+            var trunkTree = Path.Combine(trunk, "tree.txt");
+            await File.WriteAllTextAsync(trunkTree, "base\n");
+            await RunSvnAsync(server, "add", trunkTree);
+            await RunSvnAsync(server, "propset", "side", "base", trunkCode);
+            Assert.Contains("Committed revision 3.", await RunSvnAsync(server, "commit", "-m", "merge base", trunk));
+            await RunSvnAsync(server, "mkdir", server.Url + "/branches", "-m", "branches");
+            Assert.Contains("Committed revision 5.", await RunSvnAsync(server, "copy", server.Url + "/src", server.Url + "/branches/conflict", "-m", "conflict branch"));
+            await RunSvnAsync(server, "checkout", server.Url + "/branches/conflict", branch);
+
+            var branchCode = Path.Combine(branch, "code.cs");
+            await File.WriteAllTextAsync(branchCode, "branch\n");
+            await RunSvnAsync(server, "propset", "side", "branch", branchCode);
+            await RunSvnAsync(server, "delete", Path.Combine(branch, "tree.txt"));
+            Assert.Contains("Committed revision 6.", await RunSvnAsync(server, "commit", "-m", "branch changes", branch));
+
+            await File.WriteAllTextAsync(trunkCode, "trunk\n");
+            await File.WriteAllTextAsync(trunkTree, "trunk edit\n");
+            await RunSvnAsync(server, "propset", "side", "trunk", trunkCode);
+            Assert.Contains("Committed revision 7.", await RunSvnAsync(server, "commit", "-m", "trunk conflicts", trunk));
+            await RunSvnAsync(server, "update", branch);
+
+            var merge = await RunSvnAsync(server, "merge", server.Url + "/src", branch);
+            var status = await RunSvnAsync(server, "status", "--xml", branch);
+
+            Assert.Contains("Summary of conflicts", merge);
+            Assert.Contains("item=\"conflicted\"", status);
+            Assert.Contains("props=\"conflicted\"", status);
+            Assert.Contains("tree-conflicted=\"true\"", status);
+        } finally { DeleteDirectory(root); }
+    }
+
+
+    [Fact]
+    public async Task HooksRejectBeforePublishAndObserveSuccessfulCommitAndLock() {
+        var root = Path.Combine(Path.GetTempPath(), "svnflux-http-hooks-" + Guid.NewGuid().ToString("N"));
+        var workingCopy = Path.Combine(root, "working-copy");
+        var hook = new RecordingHook();
+        var errors = new List<Exception>();
+        Directory.CreateDirectory(root);
+        try {
+            var repository = new SvnMemoryRepository();
+            await using var server = await TestServer.StartAsync(repository,
+                services => services.AddSingleton<ISvnHttpHook>(hook),
+                options => options.HookError = errors.Add);
+            await RunSvnAsync(server, "checkout", server.Url, workingCopy);
+            var path = Path.Combine(workingCopy, "readme.txt");
+            await File.WriteAllTextAsync(path, "hooked");
+
+            var rejectedCommit = await RunSvnProcessAsync("commit", "-m", "reject", path);
+
+            Assert.NotEqual(0, rejectedCommit.ExitCode);
+            Assert.Contains("E165001", rejectedCommit.Error);
+            Assert.Equal(new SvnRevision(2), await repository.GetLatestRevisionAsync());
+            Assert.Single(hook.Commits);
+            Assert.Empty(hook.Committed);
+
+            hook.ThrowAfterCommit = true;
+            Assert.Contains("Committed revision 3.", await RunSvnAsync(server, "commit", "-m", "accept", path));
+            Assert.Equal(new SvnRevision(3), Assert.Single(hook.Committed).CommittedRevision);
+            Assert.Single(errors);
+            var rejectedLock = await RunSvnProcessAsync("lock", "-m", "blocked", path);
+            Assert.NotEqual(0, rejectedLock.ExitCode);
+            Assert.Contains("W160039", rejectedLock.Error);
+            Assert.Null(await repository.GetLockAsync(new("readme.txt")));
+            Assert.Contains("locked", await RunSvnAsync(server, "lock", "-m", "accepted", path), StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("accepted", Assert.Single(hook.Locked).Request.Comment);
+        } finally { DeleteDirectory(root); }
+    }
+
+    [Fact]
+    public async Task OfficialClientReadsInheritedPropertiesAndBinaryReportValues() {
+        var repository = new SvnMemoryRepository();
+        await using var server = await TestServer.StartAsync(repository);
+        await repository.CommitAsync(new(new(2), RevisionProperties("inherited properties"), [
+            SvnCommitChange.ModifyProperties(new(""), SvnNodeKind.Directory, [
+                SvnPropertyChange.Set("root-prop", "root-value"u8),
+                SvnPropertyChange.Set("binary-prop", [0, 255])
+            ]),
+            SvnCommitChange.ModifyProperties(new("src"), SvnNodeKind.Directory, [SvnPropertyChange.Set("src-prop", "src-value"u8)])
+        ]));
+
+        var properties = await RunSvnAsync(server, "proplist", "--show-inherited-props", "--verbose", server.Url + "/src/code.cs");
+
+        Assert.Contains("root-prop", properties);
+        Assert.Contains("root-value", properties);
+        Assert.Contains("src-prop", properties);
+        Assert.Contains("src-value", properties);
+        using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+        using var report = new HttpRequestMessage(HttpMethod.Parse("REPORT"), server.Url + "/!svn/rvr/3") {
+            Content = new StringContent("""<S:inherited-props-report xmlns:S="svn:"><S:revision>3</S:revision><S:path>src/code.cs</S:path></S:inherited-props-report>""", Encoding.UTF8, "text/xml")
+        };
+        using var response = await client.SendAsync(report);
+        var xml = await response.Content.ReadAsStringAsync();
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains("binary-prop", xml);
+        Assert.Contains("encoding=\"base64\"", xml);
+        Assert.Contains("AP8=", xml);
+        Assert.True(xml.IndexOf("root-prop", StringComparison.Ordinal) < xml.IndexOf("src-prop", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ReplayRevisionResourceFiltersToIncludePath() {
+        await using var server = await TestServer.StartAsync();
+        using var client = new HttpClient(new SocketsHttpHandler { UseProxy = false });
+        using var request = new HttpRequestMessage(HttpMethod.Parse("REPORT"), server.Url + "/!svn/rev/1") {
+            Content = new StringContent("""<S:replay-report xmlns:S="svn:"><S:include-path>src</S:include-path><S:low-water-mark>0</S:low-water-mark><S:send-deltas>1</S:send-deltas></S:replay-report>""", Encoding.UTF8, "text/xml")
+        };
+
+        using var response = await client.SendAsync(request);
+        var xml = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains("editor-report", xml);
+        Assert.Contains("name=\"code.cs\"", xml);
+        Assert.DoesNotContain("readme.txt", xml);
+        Assert.Contains("apply-textdelta", xml);
+    }
+
+    [Fact]
+    public async Task OfficialSvnsyncMirrorsRevisionsCopiesPropertiesAndContents() {
+        var source = new SvnMemoryRepository();
+        var destination = new SvnMemoryRepository();
+        await using var sourceServer = await TestServer.StartAsync(source);
+        await source.CommitAsync(new(new(2), RevisionProperties("mirror source"), [
+            SvnCommitChange.ModifyFile(new("readme.txt"), "mirrored content"u8),
+            SvnCommitChange.Copy(new("copied-src"), SvnNodeKind.Directory, new(new("src"), new(2)))
+                .WithPropertyChanges([SvnPropertyChange.Set("mirror", "copy"u8)])
+        ]));
+        var large = Enumerable.Range(0, 3_000_017).Select(value => (byte)(value * 131 + 17)).ToArray();
+        await source.CommitAsync(new(new(3), RevisionProperties("large and delete"), [
+            SvnCommitChange.AddFile(new("large.bin"), large),
+            SvnCommitChange.Delete(new("docs.txt"), SvnNodeKind.File)
+        ]));
+        await using var destinationServer = await TestServer.StartUnseededAsync(destination);
+
+        await RunSvnsyncAsync(sourceServer, destinationServer, "initialize", destinationServer.Url, sourceServer.Url);
+        var sync = await RunSvnsyncAsync(sourceServer, destinationServer, "synchronize", destinationServer.Url);
+
+        Assert.Contains("Committed revision 3.", sync);
+        Assert.Contains("Committed revision 4.", sync);
+        Assert.Equal(new SvnRevision(4), await destination.GetLatestRevisionAsync());
+        var root = await destination.OpenRevisionAsync(new(4));
+        await using (var stream = await root.OpenFileAsync(new("readme.txt")))
+        using (var reader = new StreamReader(stream, Encoding.UTF8))
+            Assert.Equal("mirrored content", await reader.ReadToEndAsync());
+        await using (var stream = await root.OpenFileAsync(new("copied-src/code.cs")))
+        using (var reader = new StreamReader(stream, Encoding.UTF8))
+            Assert.Equal("class C {}", await reader.ReadToEndAsync());
+        Assert.Contains(await root.GetPropertiesAsync(new("copied-src")),
+            property => property.Name == "mirror" && Encoding.UTF8.GetString(property.Value.Span) == "copy");
+        Assert.Null(await root.GetNodeInfoAsync(new("docs.txt")));
+        await using (var stream = await root.OpenFileAsync(new("large.bin"))) {
+            using var content = new MemoryStream();
+            await stream.CopyToAsync(content);
+            Assert.Equal(large, content.ToArray());
+        }
+        var mirroredProperties = await destination.GetRevisionPropertiesAsync(new(3));
+        Assert.Equal("mirror source", mirroredProperties.LogMessage);
+        var log = new List<SvnLogEntry>();
+        await foreach (var entry in destination.GetLogAsync(new([], new(3), new(3)))) log.Add(entry);
+        Assert.Contains(Assert.Single(log).ChangedPaths,
+            change => change.Path == new SvnRepositoryPath("copied-src") && change.CopyFromPath == new SvnRepositoryPath("src") && change.CopyFromRevision == new SvnRevision(2));
+    }
+
+    private sealed class RecordingHook : ISvnHttpHook {
+        public List<SvnHttpCommitHookContext> Commits { get; } = [];
+        public List<SvnHttpCommitHookContext> Committed { get; } = [];
+        public List<SvnHttpLockHookContext> Locks { get; } = [];
+        public List<SvnHttpLockHookContext> Locked { get; } = [];
+        public bool ThrowAfterCommit { get; set; }
+
+        public ValueTask BeforeCommitAsync(SvnHttpCommitHookContext context, CancellationToken cancellationToken = default) {
+            Commits.Add(context);
+            if (context.Request.RevisionProperties.LogMessage == "reject") throw new SvnHttpHookRejectedException("Rejected by test hook.");
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask AfterCommitAsync(SvnHttpCommitHookContext context, CancellationToken cancellationToken = default) {
+            Committed.Add(context);
+            if (ThrowAfterCommit) throw new InvalidOperationException("Post-commit notification failed.");
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask BeforeLockAsync(SvnHttpLockHookContext context, CancellationToken cancellationToken = default) {
+            Locks.Add(context);
+            if (context.Request.Comment == "blocked") throw new SvnHttpHookRejectedException("Rejected lock.");
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask AfterLockAsync(SvnHttpLockHookContext context, CancellationToken cancellationToken = default) {
+            Locked.Add(context);
+            return ValueTask.CompletedTask;
+        }
+    }
+
     private sealed class FailingContent(byte[] prefix) : HttpContent {
         protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context) {
             await stream.WriteAsync(prefix);
@@ -545,6 +819,28 @@ public sealed class SvnHttpIntegrationTests {
         } finally { Directory.Delete(config, true); }
     }
 
+    private static Task<(int ExitCode, string Output, string Error)> RunSvnProcessAsync(params string[] arguments) => RunProcessAsync("svn", arguments);
+
+    private static async Task<string> RunSvnsyncAsync(TestServer source, TestServer destination, params string[] arguments) {
+        var result = await RunProcessAsync("svnsync", arguments);
+        Assert.True(result.ExitCode == 0, $"svnsync exited with {result.ExitCode}:\n{result.Error}\nSource trace:\n{string.Join('\n', source.Trace)}\nDestination trace:\n{string.Join('\n', destination.Trace)}");
+        return result.Output;
+    }
+
+    private static async Task<(int ExitCode, string Output, string Error)> RunProcessAsync(string executable, params string[] arguments) {
+        var config = Path.Combine(Path.GetTempPath(), "svnflux-http-config-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(config);
+        try {
+            var start = new ProcessStartInfo(executable) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+            start.ArgumentList.Add("--non-interactive"); start.ArgumentList.Add("--config-dir"); start.ArgumentList.Add(config);
+            foreach (var argument in arguments) start.ArgumentList.Add(argument);
+            using var process = Process.Start(start)!;
+            var output = process.StandardOutput.ReadToEndAsync(); var error = process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(20));
+            return (process.ExitCode, (await output).Trim(), (await error).Trim());
+        } finally { Directory.Delete(config, true); }
+    }
+
     private sealed class TestServer : IAsyncDisposable {
         private readonly WebApplication _application;
         private TestServer(WebApplication application, string url, List<SvnHttpTrace> trace) { _application = application; Url = url; Trace = trace; }
@@ -553,7 +849,8 @@ public sealed class SvnHttpIntegrationTests {
 
         public static Task<TestServer> StartAsync() => StartAsync(new SvnMemoryRepository(Guid.Parse("b7ab8e59-dbd8-4c5b-9c49-f6d8f723981a")));
 
-        public static async Task<TestServer> StartAsync(ISvnWritableRepository repository) {
+        public static async Task<TestServer> StartAsync(ISvnWritableRepository repository, Action<IServiceCollection>? configureServices = null,
+            Action<SvnHttpOptions>? configureOptions = null) {
             var first = await repository.CommitAsync(new(new SvnRevision(0), new("tester", DateTimeOffset.Parse("2026-07-12T00:00:00Z"), "initial", SvnPropertyCollection.Empty), [
                 SvnCommitChange.AddFile(new("readme.txt"), "old"u8),
                 SvnCommitChange.AddFile(new("src/code.cs"), "class C {}"u8)
@@ -562,17 +859,25 @@ public sealed class SvnHttpIntegrationTests {
                 SvnCommitChange.ModifyFile(new("readme.txt"), Encoding.UTF8.GetBytes("hello over http")).WithPropertyChanges([SvnPropertyChange.Set("demo", "v1"u8)]),
                 SvnCommitChange.AddFile(new("docs.txt"), "documentation"u8)
             ]));
-            return await StartHostAsync(app => app.MapSvnRepository("/svn/repository", repository), "/svn/repository");
+            return await StartHostAsync(app => app.MapSvnRepository("/svn/repository", repository), "/svn/repository", configureServices, configureOptions);
         }
+
+        public static Task<TestServer> StartUnseededAsync(ISvnWritableRepository repository) =>
+            StartHostAsync(app => app.MapSvnRepository("/svn/repository", repository), "/svn/repository");
 
         public static Task<TestServer> StartManyAsync(IReadOnlyDictionary<string, ISvnRepository> repositories) =>
             StartHostAsync(app => app.MapSvnRepositories("/svn", (_, name, _) => ValueTask.FromResult(repositories.GetValueOrDefault(name))), "/svn");
 
-        private static async Task<TestServer> StartHostAsync(Action<WebApplication> map, string path) {
+        private static async Task<TestServer> StartHostAsync(Action<WebApplication> map, string path,
+            Action<IServiceCollection>? configureServices = null, Action<SvnHttpOptions>? configureOptions = null) {
             var trace = new List<SvnHttpTrace>();
             var builder = WebApplication.CreateSlimBuilder();
             builder.WebHost.UseKestrel().UseUrls("http://127.0.0.1:0");
-            builder.Services.AddSvnFluxHttp(options => options.Trace = value => { lock (trace) trace.Add(value); });
+            builder.Services.AddSvnFluxHttp(options => {
+                options.Trace = value => { lock (trace) trace.Add(value); };
+                configureOptions?.Invoke(options);
+            });
+            configureServices?.Invoke(builder.Services);
             var app = builder.Build(); map(app);
             await app.StartAsync();
             var addresses = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!;
