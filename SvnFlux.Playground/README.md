@@ -4,6 +4,22 @@
 
 Each global feature is represented by a separate scenario file under `Scenarios/` and exposed as a `System.CommandLine` subcommand.
 
+Verify the packaged official Subversion P/Invoke bindings and native runtime:
+
+```powershell
+dotnet run -- subversion-native
+```
+
+The command calls `svn_client_version()` through `SvnFlux.Subversion.Native.win-x64` and prints the loaded native Subversion version.
+
+Create a real official SVN repository and check it out without a server or `svn.exe`:
+
+```powershell
+dotnet run -- subversion-checkout
+```
+
+Each run creates a new `repository/` and `working-copy/` pair below `.playground-data/native-subversion` using `svn_repos_create()` and `svn_client_checkout4()`.
+
 Run the current ra_svn scenario:
 
 ```powershell

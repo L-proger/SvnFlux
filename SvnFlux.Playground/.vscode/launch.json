@@ -1,0 +1,71 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Subversion native smoke test",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": ["subversion-native"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "RaSvn server",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": ["rasvn", "--port", "3690", "--repository", "repository", "--path", "${workspaceFolder}/.playground-data/rasvn-repository"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Subversion native checkout",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": ["subversion-checkout", "--root", "${workspaceFolder}/.playground-data/native-subversion"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "RaSvn trace viewer",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": ["rasvn", "--port", "3690", "--repository", "repository", "--path", "${workspaceFolder}/.playground-data/rasvn-repository", "--trace"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "RaSvn publish update",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": ["rasvn", "--port", "3690", "--repository", "repository", "--path", "${workspaceFolder}/.playground-data/rasvn-repository", "--publish-update"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "CLI help",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Playground",
+      "program": "${workspaceFolder}/bin/Debug/net10.0/SvnFlux.Playground.dll",
+      "args": ["--help"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    }
+  ]
+}

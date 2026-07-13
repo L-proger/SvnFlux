@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "SvnFlux.Playground": {
+      "commandName": "Project",
+      "commandLineArgs": "subversion-checkout"
+    }
+  }
+}
